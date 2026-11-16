@@ -54,6 +54,7 @@ import {
   type AuditRole,
 } from "../../utils/auditLogStore";
 import { formatPHDate, formatPHTime, todayPHTKey, toPHTKey } from "../../utils/pht";
+import { downloadCsv } from "../../utils/csvExport";
 
 const PAGE_SIZE = 10;
 
@@ -100,13 +101,8 @@ function initials(name: string): string {
     .join("");
 }
 
-function csvCell(value: string | number | undefined | null): string {
-  const text = String(value ?? "");
-  return `"${text.replace(/"/g, '""')}"`;
-}
-
-// Export the currently-filtered activities as a CSV download (Excel-friendly:
-// BOM so ₱/em-dashes render, quoted cells so commas/newlines stay intact).
+// Export the currently-filtered activities as a CSV download through the shared
+// writer (BOM so ₱/em-dashes render, quoted cells, dated filename).
 function exportAuditCsv(rows: AuditEntry[]) {
   const header = [
     "Date & Time (PHT)",
@@ -123,7 +119,7 @@ function exportAuditCsv(rows: AuditEntry[]) {
     "Transaction ID",
     "Log ID",
   ];
-  const lines = rows.map((entry) => {
+  const body = rows.map((entry) => {
     const changes = entry.changes
       .map((change) => `${change.field}: ${change.previous} -> ${change.next}`)
       .join("; ");
@@ -141,20 +137,9 @@ function exportAuditCsv(rows: AuditEntry[]) {
       entry.device ?? "",
       entry.transactionId ?? "",
       entry.id,
-    ]
-      .map(csvCell)
-      .join(",");
+    ];
   });
-  const csv = "\uFEFF" + [header.map(csvCell).join(","), ...lines].join("\r\n");
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `docufy-audit-trail-${todayPHTKey()}.csv`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  downloadCsv({ stem: "audit-trail", header, rows: body });
 }
 
 function ChangeRow({ change }: { change: AuditChange }) {

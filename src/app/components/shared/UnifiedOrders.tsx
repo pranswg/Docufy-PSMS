@@ -63,6 +63,8 @@ import { Alert, AlertDescription } from "../ui/alert";
 import { Label } from "../ui/label";
 import { Textarea } from "../ui/textarea";
 import { ZoomSafeDropdown } from "../ui/zoom-safe-dropdown";
+import { ReportExportButton } from "../ui/report-export-dialog";
+import type { ReportSpec } from "../../utils/reportDocument";
 import { FileAttachments } from "../ui/file-attachments";
 import { ConfirmationDialog } from "../ui/confirmation-dialog";
 import { TableSkeleton } from "../ui/table-skeleton";
@@ -1253,6 +1255,114 @@ export default function UnifiedOrders({ menuItems, userRole }: UnifiedOrdersProp
     };
   }, [listOrders]);
 
+  // The export reads `filteredOrders` — the same array the table and its
+  // pagination slice — so the file holds every row the current search, date
+  // range and status card produced, not just the ten on screen. Money figures
+  // skip canceled orders; a canceled job is not revenue.
+  const buildOrdersReport = (): ReportSpec => {
+    const rows = filteredOrders.map((order) => {
+      const archive = order.retainedTransaction;
+      const pay = archive
+        ? { total: archive.total, amountPaid: archive.amountPaid, remaining: archive.balance }
+        : computeOrderPayment(order);
+      const when = order.statusUpdatedAt || order.submittedAt;
+      return [
+        order.displayId ?? order.id,
+        order.customer,
+        order.orderSource === "online" ? "Online" : "Walk-in",
+        order.type,
+        ORDER_STATUS_LABELS[order.status] ?? order.status,
+        formatPHDate(when, "short"),
+        formatPHTime(when),
+        order.paymentMethod || "—",
+        pay.total,
+        pay.amountPaid,
+        pay.remaining,
+        order.attachedFiles?.length ?? 0,
+      ];
+    });
+
+    const live = filteredOrders.filter((o) => o.status !== "canceled");
+    const money = live.reduce(
+      (acc, order) => {
+        const archive = order.retainedTransaction;
+        const pay = archive
+          ? { total: archive.total, amountPaid: archive.amountPaid, remaining: archive.balance }
+          : computeOrderPayment(order);
+        acc.total += pay.total;
+        acc.paid += pay.amountPaid;
+        acc.remaining += pay.remaining;
+        return acc;
+      },
+      { total: 0, paid: 0, remaining: 0 },
+    );
+
+    return {
+      title: "Orders",
+      subtitle:
+        statusFilter === "all"
+          ? "The active queue — awaiting-payment, released and canceled orders are on their own filters."
+          : `Filtered to ${ORDER_STATUS_LABELS[statusFilter] ?? statusFilter.toLowerCase()} orders.`,
+      filters: [
+        {
+          label: "Status",
+          value: ORDER_STATUS_LABELS[statusFilter] ?? "Active queue",
+        },
+        { label: "Search", value: searchQuery.trim() || "—" },
+        {
+          label: "From",
+          value: dateFrom ? formatPHDate(new Date(`${dateFrom}T00:00:00`), "short") : "—",
+        },
+        {
+          label: "To",
+          value: dateTo ? formatPHDate(new Date(`${dateTo}T23:59:59`), "short") : "—",
+        },
+      ],
+      blocks: [
+        {
+          kind: "summary",
+          title: "Summary",
+          items: [
+            { label: "Orders in this export", value: String(rows.length) },
+            { label: "Order value (excluding canceled)", value: formatCurrency(money.total) },
+            { label: "Collected", value: formatCurrency(money.paid) },
+            { label: "Outstanding", value: formatCurrency(money.remaining) },
+          ],
+        },
+        {
+          kind: "table",
+          title: "Orders",
+          subtitle: "Amounts are in Philippine pesos.",
+          columns: [
+            "Order",
+            "Customer",
+            "Source",
+            "Type",
+            "Status",
+            "Date",
+            "Time",
+            "Payment Method",
+            "Total",
+            "Paid",
+            "Balance",
+            "Files",
+          ],
+          align: [
+            "left", "left", "left", "left", "left", "left", "left",
+            "left", "right", "right", "right", "right",
+          ],
+          unitLabel: "order",
+          emptyMessage: "No orders match the current filters.",
+          rows,
+        },
+      ],
+      fileStem: "orders",
+      unitLabel: "order",
+      rowCount: rows.length,
+      preparedBy: user?.name,
+    };
+  };
+
   const SortableHeader = ({
     column,
     children,
@@ -1352,6 +1462,12 @@ export default function UnifiedOrders({ menuItems, userRole }: UnifiedOrdersProp
               fromLabel="From"
               toLabel="To"
               className="w-full lg:w-[21rem]"
+            />
+            {/* Same 36px height as the search box and date range it sits beside. */}
+            <ReportExportButton
+              getSpec={buildOrdersReport}
+              size="default"
+              className="w-full lg:w-auto shrink-0"
             />
           </div>
         </Card>

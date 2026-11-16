@@ -39,6 +39,8 @@ import Layout from "../Layout";
 import { Card } from "../ui/card";
 import { Button } from "../ui/button";
 import { CardSkeleton, DetailSkeleton } from "../ui/card-skeleton";
+import { ReportExportButton } from "../ui/report-export-dialog";
+import type { ReportSpec } from "../../utils/reportDocument";
 import { useHydrating } from "../../utils/useHydrating";
 import { useClickOutsideClose } from "../../hooks/useClickOutsideClose";
 import { DateRangeFilter } from "../ui/date-range-filter";
@@ -615,6 +617,7 @@ function OverviewTab({
   role = "admin",
   trend,
   dateSelector,
+  salesExport,
 }: {
   metrics: DashboardMetrics;
   navigate: ReturnType<typeof useNavigate>;
@@ -624,6 +627,8 @@ function OverviewTab({
   trend: TrendSeries;
   /** The Overview's single date control, rendered in the Sales Trend card header. */
   dateSelector: React.ReactNode;
+  /** The sales report Export trigger, admin only — staff keep the card as it was. */
+  salesExport?: React.ReactNode;
 }) {
   const {
     totalSales, totalOrders, walkInCount, activeCustomers,
@@ -676,7 +681,12 @@ function OverviewTab({
           <SectionCard
             title="Sales Trend"
             subtitle={TREND_SUBTITLE[trend.unit]}
-            headerRight={dateSelector}
+            headerRight={
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {salesExport}
+                {dateSelector}
+              </div>
+            }
           >
             {trend.points.every((point) => point.sales === 0) ? (
               // Same height as the chart so an empty range leaves a card that
@@ -1189,6 +1199,98 @@ export default function AdminDashboard({
 
   const selectedRangeLabel = DATE_RANGES.find((r) => r.id === dateRangeId)?.label || "This Month";
 
+  // The one sales report behind the dashboard's Export button: the same figures
+  // the KPI cards and the trend chart already drew, as a spreadsheet and a
+  // printable document. Nothing here recomputes a number for the file — it reads
+  // `metrics`, `trend` and the range-filtered orders exactly as the page does,
+  // so the PDF can never disagree with the screen.
+  const buildSalesReport = (): ReportSpec => {
+    const bucketNoun =
+      trend.unit === "day" ? "day" : trend.unit === "week" ? "week" : "month";
+    const trendTotal = trend.points.reduce((sum, point) => sum + point.sales, 0);
+    const bucketRows = trend.points.map((point) => [
+      point.name,
+      point.sales,
+      trendTotal > 0 ? Number(((point.sales / trendTotal) * 100).toFixed(1)) : 0,
+    ]);
+
+    const inRange = ordersInRange(dashboardOrders, dateRange).filter(
+      (order) => order.status !== "Canceled",
+    );
+    const byService = new Map<string, { orders: number; revenue: number }>();
+    for (const order of inRange) {
+      const name = deriveService(order);
+      const entry = byService.get(name) || { orders: 0, revenue: 0 };
+      entry.orders += 1;
+      entry.revenue += parseTotal(order);
+      byService.set(name, entry);
+    }
+    const serviceRows = [...byService.entries()]
+      .map(([name, s]) => [
+        name,
+        s.orders,
+        s.revenue,
+        metrics.totalSales > 0
+          ? Number(((s.revenue / metrics.totalSales) * 100).toFixed(1))
+          : 0,
+      ] as (string | number)[])
+      .sort((a, b) => (b[2] as number) - (a[2] as number));
+
+    const salesChangePct =
+      metrics.prevTotalSales > 0
+        ? ((metrics.totalSales - metrics.prevTotalSales) / metrics.prevTotalSales) * 100
+        : 0;
+
+    return {
+      title: "Sales Report",
+      subtitle: `Revenue for ${dateRange.label}.`,
+      filters: [
+        { label: "Period", value: dateRange.label },
+        { label: "Shown as", value: `Revenue per ${bucketNoun}` },
+      ],
+      blocks: [
+        {
+          kind: "summary",
+          title: "Summary",
+          items: [
+            { label: "Total Sales", value: fmt(metrics.totalSales) },
+            { label: "Total Orders", value: metrics.totalOrders.toLocaleString() },
+            { label: "Walk-in Transactions", value: metrics.walkInCount.toLocaleString() },
+            { label: "Active Customers", value: metrics.activeCustomers.toLocaleString() },
+            { label: "Previous Period Sales", value: fmt(metrics.prevTotalSales) },
+            {
+              label: "Change vs Previous Period",
+              value: `${salesChangePct >= 0 ? "+" : ""}${salesChangePct.toFixed(1)}%`,
+            },
+          ],
+        },
+        {
+          kind: "table",
+          title: `Revenue per ${bucketNoun}`,
+          subtitle: TREND_SUBTITLE[trend.unit],
+          columns: [`Calendar ${bucketNoun}`, "Revenue", "Share of Total (%)"],
+          align: ["left", "right", "right"],
+          unitLabel: bucketNoun,
+          emptyMessage: "No sales in this range.",
+          rows: bucketRows,
+        },
+        {
+          kind: "table",
+          title: "Sales by Service",
+          subtitle: "Canceled orders are excluded from revenue.",
+          columns: ["Service", "Orders", "Revenue", "Share of Total (%)"],
+          align: ["left", "right", "right", "right"],
+          unitLabel: "service",
+          emptyMessage: "No service activity in this period.",
+          rows: serviceRows,
+        },
+      ],
+      fileStem: "dashboard-sales",
+      unitLabel: "row",
+      rowCount: bucketRows.length + serviceRows.length,
+    };
+  };
+
   const overviewDateSelector = (
     <DateRangeSelector
       selectedLabel={selectedRangeLabel}
@@ -1258,6 +1360,11 @@ export default function AdminDashboard({
             role={role}
             trend={trend}
             dateSelector={overviewDateSelector}
+            salesExport={
+              role === "admin" ? (
+                <ReportExportButton getSpec={buildSalesReport} />
+              ) : null
+            }
           />
         )}
       </div>

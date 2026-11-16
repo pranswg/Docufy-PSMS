@@ -41,6 +41,8 @@ import {
 } from "../ui/dialog";
 import { ConfirmationDialog } from "../ui/confirmation-dialog";
 import { TableSkeleton } from "../ui/table-skeleton";
+import { ReportExportButton } from "../ui/report-export-dialog";
+import type { ReportSpec } from "../../utils/reportDocument";
 import { useHydrating } from "../../utils/useHydrating";
 import { dataStore } from "../../utils/dataStore";
 import { notificationStore } from "../../utils/notificationStore";
@@ -162,6 +164,42 @@ function matchesStatusFilter(
       return true;
   }
 }
+
+// The wording the Status column prints. The CSV/PDF report reads through this
+// same function so an export can never name a state differently than the list.
+function paymentStatusLabel(payment: {
+  status: string;
+  canceled?: boolean;
+  expired?: boolean;
+  isLowValueCash?: boolean;
+  submitted?: boolean;
+}): string {
+  if (payment.status === "verified") return "Verified";
+  if (payment.status === "pending") {
+    if (payment.submitted) return "Awaiting review";
+    return payment.isLowValueCash ? "Pending Payment" : "Pending";
+  }
+  if (payment.expired) return "Expired";
+  if (payment.canceled) return "Cancelled";
+  return "Rejected";
+}
+
+const PAYMENT_KIND_LABELS: Record<PaymentType["kind"], string> = {
+  cash: "Cash on Pickup",
+  online: "Full Payment",
+  "online-down": "Down Payment",
+};
+
+const STATUS_FILTER_LABELS: Record<StatusFilter, string> = {
+  all: "All statuses",
+  pending: "Pending",
+  awaitingReview: "Awaiting review",
+  verified: "Verified (all time)",
+  verifiedToday: "Verified today",
+  closed: "Cancelled / expired",
+  cancelled: "Cancelled",
+  expired: "Expired",
+};
 
 function parseOrderTotal(order: {
   total?: string;
@@ -723,6 +761,127 @@ export default function UnifiedPaymentVerification({ menuItems, userRole }: Unif
       .reduce((sum, p) => sum + p.amount, 0),
   };
 
+  // The export reads `filteredPayments` — the same array the table and its
+  // pagination slice — so the file holds every row the cards, dropdowns, search
+  // and date range produced, not just the ten on screen. Amounts stay raw
+  // pesos so a spreadsheet can sum them; the wording comes from the same label
+  // maps the rows print.
+  const buildPaymentsReport = (): ReportSpec => {
+    const rows = filteredPayments.map((p) => [
+      p.displayId ?? p.orderId,
+      p.customer,
+      PAYMENT_KIND_LABELS[p.kind],
+      p.method,
+      paymentStatusLabel(p),
+      p.totalAmount,
+      p.amountPaid,
+      p.remainingBalance,
+      formatPHDate(p.submittedAt, "short"),
+      formatPHTime(p.submittedAt),
+      p.verifiedAt ? formatPHDate(p.verifiedAt, "short") : "—",
+      p.verifiedAt ? formatPHTime(p.verifiedAt) : "—",
+      p.reference || "—",
+      p.deadline ? formatPHDateTime(p.deadline) : "—",
+    ]);
+
+    const reviewed = filteredPayments.filter((p) => p.status === "verified");
+    const awaitingDecision = filteredPayments.filter(
+      (p) => p.status === "pending" && p.submitted,
+    ).length;
+
+    return {
+      title: "Payment Verification",
+      subtitle:
+        "Payments against shop orders — what each one covers and how it was decided.",
+      filters: [
+        { label: "Status", value: STATUS_FILTER_LABELS[statusFilter] },
+        {
+          label: "Type",
+          value:
+            typeFilter === "all" ? "All types" : PAYMENT_KIND_LABELS[typeFilter],
+        },
+        {
+          label: "Method",
+          value: methodFilter === "all" ? "All methods" : methodFilter,
+        },
+        { label: "Search", value: searchQuery.trim() || "—" },
+        {
+          label: "From",
+          value: dateFrom
+            ? formatPHDate(new Date(`${dateFrom}T00:00:00`), "short")
+            : "—",
+        },
+        {
+          label: "To",
+          value: dateTo
+            ? formatPHDate(new Date(`${dateTo}T23:59:59`), "short")
+            : "—",
+        },
+      ],
+      blocks: [
+        {
+          kind: "summary",
+          title: "Summary",
+          items: [
+            { label: "Payments in this export", value: String(rows.length) },
+            {
+              label: "Verified",
+              value: String(reviewed.length),
+            },
+            {
+              label: "Verified value",
+              value: formatCurrency(
+                reviewed.reduce((sum, p) => sum + p.amountPaid, 0),
+              ),
+            },
+            { label: "Waiting on a decision", value: String(awaitingDecision) },
+            {
+              label: "Unverified amount",
+              value: formatCurrency(
+                filteredPayments
+                  .filter((p) => p.status === "pending")
+                  .reduce((sum, p) => sum + p.remainingBalance, 0),
+              ),
+            },
+          ],
+        },
+        {
+          kind: "table",
+          title: "Payments",
+          subtitle: "Amounts are in Philippine pesos.",
+          columns: [
+            "Order",
+            "Customer",
+            "Type",
+            "Method",
+            "Status",
+            "Order Total",
+            "Amount Paid",
+            "Balance",
+            "Submitted Date",
+            "Submitted Time",
+            "Verified Date",
+            "Verified Time",
+            "Reference",
+            "Payment Deadline",
+          ],
+          align: [
+            "left", "left", "left", "left", "left",
+            "right", "right", "right",
+            "left", "left", "left", "left", "left", "left",
+          ],
+          unitLabel: "payment",
+          emptyMessage: "No payments match the current filters.",
+          rows,
+        },
+      ],
+      fileStem: "payment-verification",
+      unitLabel: "payment",
+      rowCount: rows.length,
+      preparedBy: user?.name,
+    };
+  };
+
   // The empty state must say WHY the list is empty — "no payments to verify"
   // is wrong when the list is empty because of a filter, not because there is
   // nothing to do.
@@ -945,6 +1104,12 @@ export default function UnifiedPaymentVerification({ menuItems, userRole }: Unif
                 Clear filters
               </Button>
             </div>
+            {/* Same 36px height as the fields it sits beside. */}
+            <ReportExportButton
+              getSpec={buildPaymentsReport}
+              size="default"
+              className="w-full lg:w-auto shrink-0"
+            />
           </div>
         </Card>
 
@@ -1800,20 +1965,13 @@ function StatusBadge({
   submitted?: boolean;
 }) {
   const isPending = status === "pending";
-  const label =
-    status === "verified"
-      ? "Verified"
-      : isPending
-        ? submitted
-          ? "Awaiting review"
-          : lowValueCash
-            ? "Pending Payment"
-            : "Pending"
-        : expired
-          ? "Expired"
-          : canceled
-            ? "Cancelled"
-            : "Rejected";
+  const label = paymentStatusLabel({
+    status,
+    canceled,
+    expired,
+    isLowValueCash: lowValueCash,
+    submitted,
+  });
   const styles =
     status === "verified"
       ? "bg-green-50 text-green-700 border-green-200"

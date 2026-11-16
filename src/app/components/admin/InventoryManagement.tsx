@@ -22,6 +22,7 @@ import {
   CheckCircle,
   ChevronLeft,
   ChevronRight,
+  Download,
 } from "lucide-react";
 import { toast } from "sonner";
 import Layout from "../Layout";
@@ -60,7 +61,9 @@ import { ConfirmationDialog } from "../ui/confirmation-dialog";
 import { TableSkeleton } from "../ui/table-skeleton";
 import { useHydrating } from "../../utils/useHydrating";
 import { useClickOutsideClose } from "../../hooks/useClickOutsideClose";
-import { ZoomSafeDropdown } from "../ui/zoom-safe-dropdown";
+import { ZoomSafeDropdown, ZoomSafeActionDropdown } from "../ui/zoom-safe-dropdown";
+import { ReportExportDialog } from "../ui/report-export-dialog";
+import type { ReportBlock, ReportSpec } from "../../utils/reportDocument";
 import {
   BarChart,
   Bar,
@@ -177,6 +180,36 @@ function fmtMovementDateOnly(iso: string): string {
   return d.toLocaleDateString("en-PH", { month: "short", day: "numeric", year: "numeric" });
 }
 
+function fmtMovementTime(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit", hour12: true });
+}
+
+// The word an export uses for an item's stock state. It comes from
+// inventoryStore.getInventoryStatus — the same helper behind the Low Stock and
+// Out of Stock summary cards and the overview status filter — so a downloaded
+// row can never contradict the card that counted it.
+const STOCK_STATUS_LABEL: Record<InventoryStatus, string> = {
+  ok: "In Stock",
+  low: "Low Stock",
+  out: "Out of Stock",
+};
+
+// One Export menu for the whole Reports tab instead of an export button per
+// card: seven datasets, each opening the same shared CSV/PDF chooser. Separating
+// them keeps each file a single column set (a spreadsheet of only stock levels
+// sums; one that mixes stock, movements and usage does not).
+const EXPORT_DATASETS = [
+  { value: "current-stock", label: "Current stock levels" },
+  { value: "movement", label: "Stock movement by day" },
+  { value: "usage", label: "Material usage" },
+  { value: "stock-in", label: "Stock-in history" },
+  { value: "stock-out", label: "Stock-out history" },
+  { value: "alerts", label: "Inventory alerts" },
+  { value: "full", label: "Entire report (all sections)" },
+];
+
 function ReportSection({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
   return (
     <Card className="p-6 bg-white border border-slate-100 shadow-sm">
@@ -275,21 +308,31 @@ function InventoryReports() {
 
   const totalUsage = usageMap.reduce((s, u) => s + u.qty, 0);
 
-  // Stock movement over time (by day) for the bar chart
-  const movementChart = useMemo(() => {
-    const map = new Map<string, { label: string; in: number; out: number }>();
+  // Stock movement aggregated per calendar day, oldest first. The day key is the
+  // local midnight timestamp rather than the "Nov 2" label, so the series sorts
+  // chronologically — sorting the labels as text put 1 Nov before 2 Oct and made
+  // the chart read the wrong order across a month boundary.
+  const movementDaily = useMemo(() => {
+    const map = new Map<number, { time: number; label: string; in: number; out: number }>();
     for (const mv of scopedMovements) {
       const d = new Date(mv.createdAt);
-      const key = d.toLocaleDateString("en-PH", { month: "short", day: "numeric" });
-      const entry = map.get(key) || { label: key, in: 0, out: 0 };
+      if (isNaN(d.getTime())) continue;
+      const day = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+      const entry = map.get(day) || {
+        time: day,
+        label: d.toLocaleDateString("en-PH", { month: "short", day: "numeric" }),
+        in: 0,
+        out: 0,
+      };
       if (mv.type === "in") entry.in += mv.quantity;
       else entry.out += mv.quantity;
-      map.set(key, entry);
+      map.set(day, entry);
     }
-    const entries = [...map.entries()];
-    entries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-    return entries.slice(-14).map(([, v]) => v);
+    return [...map.values()].sort((a, b) => a.time - b.time);
   }, [scopedMovements]);
+
+  // The chart stays on the most recent fortnight; the export uses all of them.
+  const movementChart = useMemo(() => movementDaily.slice(-14), [movementDaily]);
 
   const currentReportItems = useMemo(() => {
     let list = activeItems;
@@ -299,6 +342,261 @@ function InventoryReports() {
   }, [activeItems, categoryFilter, itemFilter]);
 
   const alerts = [...outOfStockItems, ...lowStockItems];
+
+  const { user } = useAuth();
+  const [exportDataset, setExportDataset] = useState<string | null>(null);
+
+  // Every dataset the tab shows, as a report spec. Each one reads the FULL
+  // array behind its card — currentReportItems, scopedIn/scopedOut, usageMap,
+  // alerts, movementDaily — never the .slice() the page caps to, so a download
+  // holds the whole period rather than only the first eight rows on screen.
+  const reportSpecs = useMemo<Record<string, ReportSpec>>(() => {
+    const filterNames = [
+      { label: "Period", value: range.label },
+      {
+        label: "Category",
+        value: categoryFilter === "all" ? "All categories" : categoryFilter,
+      },
+      {
+        label: "Item",
+        value:
+          itemFilter === "all"
+            ? "All items"
+            : items.find((i) => i.id === itemFilter)?.name || itemFilter,
+      },
+    ];
+
+    const stockBlock: ReportBlock = {
+      kind: "table",
+      title: "Current Stock Levels",
+      subtitle:
+        "Pieces in Stock converts each item through its pieces-per-unit (one ream = 500 sheets).",
+      columns: ["Item", "Category", "Unit", "Current Stock", "Pieces in Stock", "Min Stock", "Status"],
+      align: ["left", "left", "left", "right", "right", "right", "left"],
+      unitLabel: "item",
+      emptyMessage: "No inventory items match the current filters.",
+      rows: currentReportItems.map((item) => [
+        item.name,
+        item.category,
+        item.unit,
+        item.currentStock,
+        inventoryStore.getItemPieces(item),
+        item.minimumStock,
+        STOCK_STATUS_LABEL[inventoryStore.getInventoryStatus(item)],
+      ]),
+    };
+
+    const movementBlock: ReportBlock = {
+      kind: "table",
+      title: "Stock Movement by Day",
+      subtitle: "Stock In and Stock Out totals for each day in the period.",
+      columns: ["Date", "Stock In", "Stock Out", "Net Change"],
+      align: ["left", "right", "right", "right"],
+      unitLabel: "day",
+      emptyMessage: "No stock movement recorded for this period.",
+      rows: movementDaily.map((day) => [
+        new Date(day.time).toLocaleDateString("en-PH", {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        }),
+        day.in,
+        day.out,
+        day.in - day.out,
+      ]),
+    };
+
+    const usageBlock: ReportBlock = {
+      kind: "table",
+      title: "Material Usage",
+      subtitle: "Quantity consumed per item during the period, highest first.",
+      columns: ["Item", "Unit", "Quantity Used", "Share of Usage (%)"],
+      align: ["left", "left", "right", "right"],
+      unitLabel: "material",
+      emptyMessage: "No material usage recorded for this period.",
+      rows: usageMap.map((u) => [
+        u.name,
+        itemById(u.id)?.unit || "units",
+        u.qty,
+        totalUsage > 0 ? Number(((u.qty / totalUsage) * 100).toFixed(1)) : 0,
+      ]),
+    };
+
+    const movementRows = (list: StockMovement[]) =>
+      list.map((m) => [
+        fmtMovementDateOnly(m.createdAt),
+        fmtMovementTime(m.createdAt),
+        m.itemName,
+        m.quantity,
+        m.unit,
+        m.reason || "",
+        m.person || "",
+      ]);
+
+    const stockInBlock: ReportBlock = {
+      kind: "table",
+      title: "Stock-In History",
+      subtitle: "Every item added during the period.",
+      columns: ["Date", "Time", "Item", "Quantity", "Unit", "Reason", "Recorded By"],
+      align: ["left", "left", "left", "right", "left", "left", "left"],
+      unitLabel: "stock-in record",
+      emptyMessage: "No stock-in records for this period.",
+      rows: movementRows(scopedIn),
+    };
+
+    const stockOutBlock: ReportBlock = {
+      kind: "table",
+      title: "Stock-Out History",
+      subtitle: "Every item removed or consumed during the period.",
+      columns: ["Date", "Time", "Item", "Quantity", "Unit", "Reason", "Recorded By"],
+      align: ["left", "left", "left", "right", "left", "left", "left"],
+      unitLabel: "stock-out record",
+      emptyMessage: "No stock-out records for this period.",
+      rows: movementRows(scopedOut),
+    };
+
+    const alertBlock: ReportBlock = {
+      kind: "table",
+      title: "Inventory Alerts",
+      subtitle: "Out of Stock and Low Stock items, counted the same way the summary cards count them.",
+      columns: ["Item", "Category", "Unit", "Current Stock", "Min Stock", "Status"],
+      align: ["left", "left", "left", "right", "right", "left"],
+      unitLabel: "alert",
+      emptyMessage: "All inventory levels are currently healthy.",
+      rows: alerts.map((item) => [
+        item.name,
+        item.category,
+        item.unit,
+        item.currentStock,
+        item.minimumStock,
+        STOCK_STATUS_LABEL[inventoryStore.getInventoryStatus(item)],
+      ]),
+    };
+
+    const summaryBlock: ReportBlock = {
+      kind: "summary",
+      title: "Period Summary",
+      items: [
+        { label: "Total Items", value: String(activeItems.length) },
+        { label: "Low Stock", value: String(lowStockItems.length) },
+        { label: "Out of Stock", value: String(outOfStockItems.length) },
+        { label: "Stock In", value: fmtQty(totalStockIn) },
+        { label: "Stock Out", value: fmtQty(totalStockOut) },
+        { label: "Materials Used", value: String(usageMap.length) },
+      ],
+    };
+
+    const fullCount =
+      stockBlock.rows.length +
+      movementBlock.rows.length +
+      usageBlock.rows.length +
+      stockInBlock.rows.length +
+      stockOutBlock.rows.length +
+      alertBlock.rows.length;
+
+    const periodLabel = `Covering ${range.label}`;
+    const preparedBy = user?.name;
+
+    return {
+      "current-stock": {
+        title: "Inventory — Current Stock Levels",
+        subtitle: periodLabel,
+        filters: filterNames,
+        blocks: [stockBlock],
+        fileStem: "inventory-current-stock",
+        unitLabel: "item",
+        rowCount: stockBlock.rows.length,
+        preparedBy,
+      },
+      movement: {
+        title: "Inventory — Stock Movement by Day",
+        subtitle: periodLabel,
+        filters: filterNames,
+        blocks: [movementBlock],
+        fileStem: "inventory-stock-movement",
+        unitLabel: "day",
+        rowCount: movementBlock.rows.length,
+        preparedBy,
+      },
+      usage: {
+        title: "Inventory — Material Usage",
+        subtitle: periodLabel,
+        filters: filterNames,
+        blocks: [usageBlock],
+        fileStem: "inventory-material-usage",
+        unitLabel: "material",
+        rowCount: usageBlock.rows.length,
+        preparedBy,
+      },
+      "stock-in": {
+        title: "Inventory — Stock-In History",
+        subtitle: periodLabel,
+        filters: filterNames,
+        blocks: [stockInBlock],
+        fileStem: "inventory-stock-in",
+        unitLabel: "stock-in record",
+        rowCount: stockInBlock.rows.length,
+        preparedBy,
+      },
+      "stock-out": {
+        title: "Inventory — Stock-Out History",
+        subtitle: periodLabel,
+        filters: filterNames,
+        blocks: [stockOutBlock],
+        fileStem: "inventory-stock-out",
+        unitLabel: "stock-out record",
+        rowCount: stockOutBlock.rows.length,
+        preparedBy,
+      },
+      alerts: {
+        title: "Inventory — Alerts",
+        subtitle: "Items below their minimum stock right now",
+        filters: filterNames.slice(1),
+        blocks: [alertBlock],
+        fileStem: "inventory-alerts",
+        unitLabel: "alert",
+        rowCount: alertBlock.rows.length,
+        preparedBy,
+      },
+      full: {
+        title: "Inventory Report",
+        subtitle: periodLabel,
+        filters: filterNames,
+        blocks: [
+          summaryBlock,
+          stockBlock,
+          movementBlock,
+          usageBlock,
+          stockInBlock,
+          stockOutBlock,
+          alertBlock,
+        ],
+        fileStem: "inventory-full-report",
+        unitLabel: "row",
+        rowCount: fullCount,
+        preparedBy,
+      },
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    range,
+    categoryFilter,
+    itemFilter,
+    items,
+    currentReportItems,
+    movementDaily,
+    usageMap,
+    totalUsage,
+    scopedIn,
+    scopedOut,
+    alerts,
+    activeItems,
+    lowStockItems,
+    outOfStockItems,
+    totalStockIn,
+    totalStockOut,
+    user?.name,
+  ]);
 
   return (
     <div className="space-y-6">
@@ -374,6 +672,14 @@ function InventoryReports() {
               { value: "all", label: "All Items" },
               ...(categoryFilter === "all" ? items : items.filter((i) => i.category === categoryFilter)).map((i) => ({ value: i.id, label: i.name })),
             ]}
+          />
+          <ZoomSafeActionDropdown
+            label="Export report"
+            placeholder="Export"
+            icon={<Download className="w-4 h-4 text-[#2F6FD6]" />}
+            options={EXPORT_DATASETS}
+            onSelect={(v) => setExportDataset(v)}
+            className="min-w-[170px]"
           />
         </div>
       </div>
@@ -583,6 +889,14 @@ function InventoryReports() {
           </div>
         )}
       </ReportSection>
+
+      <ReportExportDialog
+        open={exportDataset !== null}
+        onOpenChange={(open) => {
+          if (!open) setExportDataset(null);
+        }}
+        spec={exportDataset ? reportSpecs[exportDataset] ?? null : null}
+      />
     </div>
   );
 }

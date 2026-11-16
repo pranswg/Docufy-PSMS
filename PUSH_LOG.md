@@ -1654,3 +1654,17 @@ New entries are added at the bottom, below the most recent one, so the log reads
 - Left the untracked `mockups/use-case-diagram.html` / `.png` and `screenshots/` out of this commit; they are not part of this work.
 - Promoted this batch to `deployment` from the same commit, so production and the work branch stay identical.
 - Typecheck and production build pass. Not exercised live — there is no Supabase dashboard access and no staff credentials in this environment.
+
+
+## 2026-11-17 - Prans (7:42 AM PHT)
+
+- Added report exports across the system, and one page-orientation choice before a PDF is written.
+- Added report data exports: every report page now carries one Export control that produces the same figures the screen shows, as a CSV for Excel or a printable A4 PDF, built from the FULL filtered lists rather than only the rows currently paged in.
+- Added a page-orientation window before a PDF download: Download PDF now asks Landscape or Portrait (Landscape preselected, wide tables kept on one page) with a Cancel that returns to the export window and downloads nothing, because how a report reads on paper is the operator's call, not the app's.
+- Unified Inventory behind one Export dropdown: the overview and the Reports tab no longer have separate download affordances, and a multi-section selection is written as one document whose tables stay in reading order.
+- Wired exports into Orders, Payment Verification and the dashboard sales report: each builds its figures from the search, filter and date range already applied on that page, so a download always matches what was just read.
+- Moved the landing-page paused / closed banner inside the page's main container, directly above the "Your Printing Companion" hero, so the outage notice reads as part of the page instead of a strip floating over it; the top-margin hack that cleared the fixed header is gone now the hero already reserves that space.
+- Shared the export plumbing: the receipt's own HTML-to-PDF, save and logo helpers and the audit trail's hand-rolled CSV writer were lifted into one utility each, used by reports, receipts and the audit log alike, so a receipt, a report and an audit CSV can no longer rasterize or quote differently. No receipt or audit output changed.
+- Excluded from this commit: `supabase/.temp/cli-latest` (Supabase CLI bookkeeping) and the untracked `mockups/admin-confirm-pricing.html` / `.png`, which belong to another change.
+- Not promoted to `deployment` — this push is `frontend-dev` only, as asked.
+- Typecheck and production build pass. The orientation window was verified in a desktop-width dev harness (temporary route, since removed) at 1440x900 and 480x900: a real portrait PDF was produced end to end, Cancel closes only that window and leaves the export window open, and Enter fires the focused window's own primary action, so stacked windows cannot double-download. The report pages themselves are code-verified — no staff or admin credentials exist in this environment.

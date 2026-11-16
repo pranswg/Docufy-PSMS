@@ -464,16 +464,13 @@ export default function LandingPage({
         )}
       </header>
 
-      <div className="relative z-10 mx-auto w-full max-w-7xl min-[1366px]:max-w-[93.7vw] px-4 sm:px-6 pt-4">
-        <ShopStatusBanner className="mt-24 sm:mt-28" />
-      </div>
-
       {/* Hero Section */}
       <section
         id="home"
         className="relative z-10 w-full bg-white pb-10 pt-24 sm:pb-20 sm:pt-32 [background-image:radial-gradient(circle_at_top_right,rgba(29,115,236,0.07),transparent_42%),radial-gradient(circle_at_bottom_left,rgba(47,111,214,0.06),transparent_42%),linear-gradient(to_bottom,transparent_78%,#F2F7FF)]"
       >
         <div className="relative mx-auto w-full max-w-7xl min-[1366px]:max-w-[93.7vw] px-4 sm:px-6">
+          <ShopStatusBanner className="mb-6 sm:mb-8" />
           <div className="grid grid-cols-1 items-center gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] lg:gap-[3.5vw]">
             <div className="min-w-0 text-center lg:text-left">
               <div className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-[#1668D9]/20 text-[#1668D9] rounded-full text-sm font-medium mb-6">
