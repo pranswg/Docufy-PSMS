@@ -4,16 +4,16 @@ import React from "react";
 import {
   LayoutDashboard,
   CreditCard,
+  QrCode,
   Package,
   Boxes,
   Users,
-  FileText,
   Briefcase,
-  Settings,
   ShoppingCart,
-  Shield,
-  FileCheck,
-  Database,
+  BadgeDollarSign,
+  MonitorPlay,
+  ScrollText,
+  History,
 } from "lucide-react";
 
 export const adminMenuItems = [
@@ -23,9 +23,19 @@ export const adminMenuItems = [
     icon: <LayoutDashboard className="w-5 h-5" />,
   },
   {
+    label: "Walk-in Transactions",
+    path: "/admin/walk-in",
+    icon: <ShoppingCart className="w-5 h-5" />,
+  },
+  {
     label: "Payment Verification",
     path: "/admin/payment-verification",
     icon: <CreditCard className="w-5 h-5" />,
+  },
+  {
+    label: "Payment Methods",
+    path: "/admin/payment-methods",
+    icon: <QrCode className="w-5 h-5" />,
   },
   {
     label: "Orders",
@@ -33,24 +43,9 @@ export const adminMenuItems = [
     icon: <Package className="w-5 h-5" />,
   },
   {
-    label: "Walk-in Transactions",
-    path: "/admin/walk-in",
-    icon: <ShoppingCart className="w-5 h-5" />,
-  },
-  {
     label: "Inventory",
     path: "/admin/inventory",
     icon: <Boxes className="w-5 h-5" />,
-  },
-  {
-    label: "Staff",
-    path: "/admin/staff",
-    icon: <Users className="w-5 h-5" />,
-  },
-  {
-    label: "Reports",
-    path: "/admin/reports",
-    icon: <FileText className="w-5 h-5" />,
   },
   {
     label: "Job Board",
@@ -58,23 +53,28 @@ export const adminMenuItems = [
     icon: <Briefcase className="w-5 h-5" />,
   },
   {
-    label: "Content Management",
-    path: "/admin/content",
-    icon: <Settings className="w-5 h-5" />,
+    label: "Staff Management",
+    path: "/admin/staff",
+    icon: <Users className="w-5 h-5" />,
   },
   {
-    label: "Security Center",
-    path: "/admin/security-center",
-    icon: <Shield className="w-5 h-5" />,
+    label: "Pricing Management",
+    path: "/admin/pricing",
+    icon: <BadgeDollarSign className="w-5 h-5" />,
   },
   {
-    label: "Audit Logs",
-    path: "/admin/audit-logs",
-    icon: <FileCheck className="w-5 h-5" />,
+    label: "Landing Page",
+    path: "/admin/landing",
+    icon: <MonitorPlay className="w-5 h-5" />,
   },
   {
-    label: "Backup & Integrity",
-    path: "/admin/backup-management",
-    icon: <Database className="w-5 h-5" />,
+    label: "Terms & Privacy",
+    path: "/admin/legal",
+    icon: <ScrollText className="w-5 h-5" />,
+  },
+  {
+    label: "Audit Trail",
+    path: "/admin/audit-trail",
+    icon: <History className="w-5 h-5" />,
   },
 ];

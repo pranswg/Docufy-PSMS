@@ -1,16 +1,20 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router';
 import { adminMenuItems } from '../../utils/adminMenuItems';
-import { User, Mail, Phone, Calendar, Shield, Save, ArrowLeft, CheckCircle, Key, BriefcaseBusiness, AlertCircle } from 'lucide-react';
+import { User, Mail, Phone, Calendar, Shield, Save, ArrowLeft, CheckCircle, Key, BriefcaseBusiness, AlertCircle, Camera, Eye, EyeOff } from 'lucide-react';
 import { toast } from 'sonner';
+import { AvatarCropDialog } from '../ui/avatar-crop-dialog';
 import Layout from '../Layout';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../ui/dialog';
+import { ConfirmationDialog } from '../ui/confirmation-dialog';
 import { useAuth } from '../../contexts/AuthContext';
 import { PasswordStrengthIndicator, validatePassword } from '../ui/password-strength-indicator';
+import { isDataUrl } from '../../utils/supabaseAvatar';
+import type { Database } from '../../../lib/database.types';
 
 const menuItems = adminMenuItems;
 
@@ -29,16 +33,23 @@ const defaultProfileData = {
 
 export default function AdminProfile() {
   const navigate = useNavigate();
-  const { user, enableMFA, disableMFA, resetPassword } = useAuth();
+  const { user, resetPassword, updateProfile, updateProfileImage, syncProfileDetails, logout } = useAuth();
   const [isEditing, setIsEditing] = useState(false);
+  // Saving uploads the avatar to Supabase Storage, so it is a real round-trip.
+  const [saving, setSaving] = useState(false);
   const [showSavedMessage, setShowSavedMessage] = useState(false);
+  const [showSuccessDialog, setShowSuccessDialog] = useState(false);
   const [showChangePasswordDialog, setShowChangePasswordDialog] = useState(false);
-  const [mfaEnabled, setMfaEnabled] = useState(user?.mfaEnabled || false);
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [profileImage, setProfileImage] = useState<string | null>(() => user?.profileImage || null);
   const [passwordData, setPasswordData] = useState({
-    currentPassword: '',
-    newPassword: '',
-    confirmPassword: '',
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: "",
   });
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [formData, setFormData] = useState(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
     const nameParts = (user?.name || '').split(' ');
@@ -81,14 +92,81 @@ export default function AdminProfile() {
     };
   });
 
-  const handleSave = () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(formData));
-    setIsEditing(false);
-    setShowSavedMessage(true);
-    setTimeout(() => setShowSavedMessage(false), 3000);
+  const [cropSource, setCropSource] = useState<string | null>(null);
+
+  const handleProfileImageChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // Reset first so the same file can be picked again after a cancel.
+    event.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      toast.error('Please choose an image file.');
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error('Please choose an image smaller than 2MB.');
+      return;
+    }
+    // Open the cropper; the avatar only changes once the square is confirmed.
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : null;
+      if (result) setCropSource(result);
+    };
+    reader.readAsDataURL(file);
   };
 
-  const handleChangePassword = () => {
+  const handleSave = async () => {
+    const { normalizeNameForSave, normalizePhoneForSave } = await import('../../utils/inputSanitizers');
+    const sanitizedFirst = normalizeNameForSave(formData.firstName);
+    const sanitizedLast = normalizeNameForSave(formData.lastName);
+    const sanitizedPhone = normalizePhoneForSave(formData.phone);
+    setFormData((prev: any) => ({ ...prev, firstName: sanitizedFirst, lastName: sanitizedLast, phone: sanitizedPhone }));
+    const displayName =
+      `${sanitizedFirst} ${sanitizedLast}`.trim() || user?.name || 'Admin User';
+    setSaving(true);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...formData, firstName: sanitizedFirst, lastName: sanitizedLast, phone: sanitizedPhone }));
+      // The picture is Supabase-ONLY: it must reach storage + the profiles table
+      // before it counts. A failed upload never falls back to localStorage — the
+      // chosen picture stays in the form so the user can retry, clearly surfaced.
+      const pictureChanged = (profileImage ?? null) !== (user?.profileImage ?? null);
+      let pictureError: string | null = null;
+      if (pictureChanged) {
+        const result = await updateProfileImage(profileImage ?? null);
+        if (!result.ok) pictureError = result.message;
+      }
+
+      // Push text details to the signed-in user's OWN profiles row. The email is
+      // excluded — it is the registered account email and is not editable.
+      const patch: Database['public']['Tables']['profiles']['Update'] = {
+        full_name: displayName,
+        phone: sanitizedPhone.trim() || null,
+      };
+      const detailsResult = await syncProfileDetails(patch);
+      const detailsError = detailsResult.ok ? null : detailsResult.message;
+
+      updateProfile({ name: displayName, phone: sanitizedPhone.trim() || undefined });
+      setSaving(false);
+
+      if (detailsError || pictureError) {
+        const problems = [
+          detailsError ? `Your details weren't saved — ${detailsError}` : null,
+          pictureError ? `Your photo wasn't saved — ${pictureError}` : null,
+        ].filter(Boolean).join(' ');
+        toast.error(`Your changes were kept on this device. ${problems}`);
+        return;
+      }
+
+      setIsEditing(false);
+      setShowSavedMessage(true);
+      setShowSuccessDialog(true);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleChangePassword = async () => {
     console.log('Change password clicked');
 
     if (!passwordData.currentPassword || !passwordData.newPassword || !passwordData.confirmPassword) {
@@ -116,8 +194,17 @@ export default function AdminProfile() {
 
     console.log('All validations passed, calling resetPassword');
 
-    // Use the resetPassword function from AuthContext (with user email)
-    if (user && resetPassword(user.email, passwordData.currentPassword, passwordData.newPassword)) {
+    if (!user) {
+      toast.error('You are signed out — sign in again to change your password.');
+      return;
+    }
+
+    const result = await resetPassword(
+      user.email,
+      passwordData.currentPassword,
+      passwordData.newPassword,
+    );
+    if (result.success) {
       console.log('Password reset successful');
       toast.success('Password changed successfully!');
       setShowChangePasswordDialog(false);
@@ -128,19 +215,11 @@ export default function AdminProfile() {
       });
     } else {
       console.log('Password reset failed');
-      toast.error('Current password is incorrect or password was previously used');
-    }
-  };
-
-  const handleToggleMFA = () => {
-    if (mfaEnabled) {
-      disableMFA();
-      setMfaEnabled(false);
-      toast.success('MFA disabled');
-    } else {
-      enableMFA();
-      setMfaEnabled(true);
-      toast.success('MFA enabled');
+      toast.error(
+        result.reason === 'current_password'
+          ? 'Your current password is incorrect.'
+          : 'That new password was refused. Please choose a different one.',
+      );
     }
   };
 
@@ -151,11 +230,11 @@ export default function AdminProfile() {
         <div className="bg-white rounded-xl p-6 shadow-sm border border-gray-100">
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-3xl font-bold text-gray-900 mb-2">Administrator Profile</h1>
+              <h2 className="text-3xl font-bold text-gray-900 mb-2">Administrator Profile</h2>
               <p className="text-gray-600">Manage your admin account and system settings</p>
             </div>
-            <Button variant="outline" onClick={() => navigate('/admin/dashboard')}>
-              <ArrowLeft className="w-4 h-4 mr-2" />
+            <Button variant="ghost" className="hidden md:inline-flex" onClick={() => navigate('/admin/dashboard')}>
+              <ArrowLeft className="w-4 h-4" />
               Back
             </Button>
           </div>
@@ -174,9 +253,23 @@ export default function AdminProfile() {
           <div className="flex flex-col md:flex-row gap-6 mb-6">
             {/* Avatar */}
             <div className="flex flex-col items-center gap-4">
-              <div className="w-32 h-32 bg-[#1D73EC] rounded-full flex items-center justify-center">
-                <Shield className="w-16 h-16 text-white" />
+              <div className="relative flex h-32 w-32 items-center justify-center rounded-full bg-[#1668D9] text-3xl font-semibold text-white">
+                {profileImage ? <img src={profileImage} alt="Profile" className="h-full w-full rounded-full object-cover" /> : (user?.name || 'User').split(' ').map(part => part[0]).join('').slice(0, 2).toUpperCase()}
+                {isEditing && (
+                  <label className="absolute -bottom-1 -right-1 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-[#1668D9] text-white shadow-lg ring-2 ring-white">
+                    <Camera className="h-4 w-4" />
+                    <input type="file" accept="image/*" className="hidden" onChange={handleProfileImageChange} />
+                  </label>
+                )}
+                {isEditing && profileImage && (
+                  <Button type="button" variant="link" size="sm" onClick={() => setProfileImage(null)} className="absolute -bottom-9 left-1/2 h-auto -translate-x-1/2 whitespace-nowrap px-0 text-xs text-red-600 hover:text-red-700">Remove photo</Button>
+                )}
               </div>
+              {!isEditing && profileImage && isDataUrl(profileImage) && (
+                <span className="whitespace-nowrap rounded-md bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-700 ring-1 ring-amber-200">
+                  Profile picture was not saved — upload failed
+                </span>
+              )}
               <Badge className="bg-red-100 text-red-700 font-medium">Administrator</Badge>
             </div>
 
@@ -193,27 +286,32 @@ export default function AdminProfile() {
                 </div>
                 <div className="flex flex-col items-end gap-2">
                   <Button
+                    variant={isEditing ? "primary" : "outline"}
                     onClick={() => isEditing ? handleSave() : setIsEditing(true)}
-                    className="bg-[#2F6FD6] hover:bg-[#2557b8] text-white"
+                    loading={saving && isEditing}
+                    loadingText="Saving..."
                   >
-                    <Save className="w-4 h-4 mr-2" />
+                    {!saving || !isEditing ? <Save className="w-4 h-4 mr-2" /> : null}
                     {isEditing ? 'Save Changes' : 'Edit Profile'}
                   </Button>
-                  <Badge className="bg-green-100 text-blue-700 font-medium">{formData.workStatus}</Badge>
+                  <Badge className="bg-blue-100 text-blue-700 font-medium">{formData.workStatus}</Badge>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+              <div className="grid grid-cols-1 @min-[640px]:grid-cols-2 gap-4 mt-4">
                 <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
                   <User className="w-5 h-5 text-[#2F6FD6]" />
                   <div>
                     <p className="text-xs text-gray-500">First Name</p>
                     {isEditing ? (
-                      <input
+                      <Input
                         type="text"
+                        lettersOnly
+                        maxDigits={50}
                         value={formData.firstName}
                         onChange={(e) => setFormData({ ...formData, firstName: e.target.value })}
-                        className="text-sm font-medium text-gray-900 bg-transparent border-b border-gray-300 focus:outline-none focus:border-[#2F6FD6]"
+                        className="text-sm font-medium text-gray-900 bg-transparent border-0 border-b border-gray-300 rounded-none px-0 h-auto focus-visible:ring-0 focus-visible:border-[#2F6FD6]"
+                        maxLength={50}
                       />
                     ) : (
                       <p className="text-sm font-medium text-gray-900">{formData.firstName}</p>
@@ -226,11 +324,14 @@ export default function AdminProfile() {
                   <div>
                     <p className="text-xs text-gray-500">Last Name</p>
                     {isEditing ? (
-                      <input
+                      <Input
                         type="text"
+                        lettersOnly
+                        maxDigits={50}
                         value={formData.lastName}
                         onChange={(e) => setFormData({ ...formData, lastName: e.target.value })}
-                        className="text-sm font-medium text-gray-900 bg-transparent border-b border-gray-300 focus:outline-none focus:border-[#2F6FD6]"
+                        className="text-sm font-medium text-gray-900 bg-transparent border-0 border-b border-gray-300 rounded-none px-0 h-auto focus-visible:ring-0 focus-visible:border-[#2F6FD6]"
+                        maxLength={50}
                       />
                     ) : (
                       <p className="text-sm font-medium text-gray-900">{formData.lastName}</p>
@@ -246,8 +347,10 @@ export default function AdminProfile() {
                       <input
                         type="email"
                         value={formData.email}
-                        onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                        className="text-sm font-medium text-gray-900 bg-transparent border-b border-gray-300 focus:outline-none focus:border-[#2F6FD6]"
+                        disabled
+                        aria-disabled="true"
+                        title="Your registered email address cannot be changed"
+                        className="text-sm font-medium text-gray-900 bg-transparent border-b border-gray-300 opacity-60 cursor-not-allowed"
                       />
                     ) : (
                       <p className="text-sm font-medium text-gray-900">{formData.email}</p>
@@ -260,11 +363,15 @@ export default function AdminProfile() {
                   <div>
                     <p className="text-xs text-gray-500">Phone</p>
                     {isEditing ? (
-                      <input
+                      <Input
                         type="tel"
+                        phoneOnly
+                        maxDigits={11}
                         value={formData.phone}
                         onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
-                        className="text-sm font-medium text-gray-900 bg-transparent border-b border-gray-300 focus:outline-none focus:border-[#2F6FD6]"
+                        className="text-sm font-medium text-gray-900 bg-transparent border-0 border-b border-gray-300 rounded-none px-0 h-auto focus-visible:ring-0 focus-visible:border-[#2F6FD6]"
+                        placeholder="09XXXXXXXXX"
+                        maxLength={11}
                       />
                     ) : (
                       <p className="text-sm font-medium text-gray-900">{formData.phone}</p>
@@ -287,12 +394,12 @@ export default function AdminProfile() {
         {/* Admin Permissions */}
         <Card className="p-6 bg-white shadow-sm">
           <h3 className="text-xl font-bold text-gray-900 mb-4">Administrator Permissions</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 @min-[640px]:grid-cols-2 gap-3">
             {[
               'Manage Users & Accounts',
               'Payment Verification',
               'Order Management',
-              'Inventory Control',
+              'Manage shop operations and staff',
               'Staff Management',
               'Generate Reports',
               'System Configuration',
@@ -311,34 +418,16 @@ export default function AdminProfile() {
           <h3 className="text-xl font-bold text-gray-900 mb-4">Security Settings</h3>
           <div className="space-y-4">
             <Button
-              variant="outline"
+              variant="primary"
               onClick={() => setShowChangePasswordDialog(true)}
-              className="w-full md:w-auto border-[#2F6FD6] text-[#2F6FD6] hover:bg-[#2F6FD6] hover:text-white"
+              className="w-full md:w-auto"
             >
               <Key className="w-4 h-4 mr-2" />
               Change Password
             </Button>
-
-            <div className="flex items-center justify-between p-4 border rounded-lg">
-              <div>
-                <p className="font-medium text-gray-900">Multi-Factor Authentication (MFA)</p>
-                <p className="text-sm text-gray-500">Add an extra layer of security to your account</p>
-              </div>
-              <button
-                onClick={handleToggleMFA}
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                  mfaEnabled ? 'bg-[#1D73EC]' : 'bg-gray-300'
-                }`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                    mfaEnabled ? 'translate-x-6' : 'translate-x-1'
-                  }`}
-                />
-              </button>
-            </div>
           </div>
         </Card>
+        <Button variant="destructive" onClick={() => setShowLogoutConfirm(true)} className="w-full">Sign Out</Button>
       </div>
 
       {/* Change Password Dialog */}
@@ -347,7 +436,7 @@ export default function AdminProfile() {
           <DialogHeader>
             <div className="flex items-center gap-3 mb-2">
               <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-                <Key className="w-6 h-6 text-[#1D73EC]" />
+                <Key className="w-6 h-6 text-[#1668D9]" />
               </div>
               <DialogTitle className="text-xl">Change Password</DialogTitle>
             </div>
@@ -358,24 +447,45 @@ export default function AdminProfile() {
           <div className="space-y-4 py-4">
             <div className="space-y-2">
               <Label htmlFor="currentPassword">Current Password</Label>
-              <Input
-                id="currentPassword"
-                type="password"
-                value={passwordData.currentPassword}
-                onChange={(e) => setPasswordData(prev => ({ ...prev, currentPassword: e.target.value }))}
-                placeholder="Enter current password"
-              />
+              <div className="relative">
+                <Input
+                  id="currentPassword"
+                  type={showCurrentPassword ? "text" : "password"}
+                  value={passwordData.currentPassword}
+                  onChange={(e) => setPasswordData(prev => ({ ...prev, currentPassword: e.target.value }))}
+                  placeholder="Enter current password"
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowCurrentPassword(!showCurrentPassword)}
+                  aria-label={showCurrentPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600"
+                >
+                  {showCurrentPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </div>
             <div className="space-y-2">
               <Label htmlFor="newPassword">New Password</Label>
-              <Input
-                id="newPassword"
-                type="password"
-                value={passwordData.newPassword}
-                onChange={(e) => setPasswordData(prev => ({ ...prev, newPassword: e.target.value }))}
-                placeholder="Enter new password (min. 8 characters)"
-                className={passwordData.currentPassword && passwordData.newPassword && passwordData.currentPassword === passwordData.newPassword ? "border-red-500" : ""}
-              />
+              <div className="relative">
+                <Input
+                  id="newPassword"
+                  type={showNewPassword ? "text" : "password"}
+                  value={passwordData.newPassword}
+                  onChange={(e) => setPasswordData(prev => ({ ...prev, newPassword: e.target.value }))}
+                  placeholder="Enter new password (min. 8 characters)"
+                  className={`pr-10 ${passwordData.currentPassword && passwordData.newPassword && passwordData.currentPassword === passwordData.newPassword ? "border-red-500" : ""}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPassword(!showNewPassword)}
+                  aria-label={showNewPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600"
+                >
+                  {showNewPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
               {passwordData.currentPassword && passwordData.newPassword && passwordData.currentPassword === passwordData.newPassword && (
                 <div className="flex items-center gap-2 text-red-600 text-sm mt-1">
                   <AlertCircle className="w-4 h-4" />
@@ -390,13 +500,24 @@ export default function AdminProfile() {
             </div>
             <div className="space-y-2">
               <Label htmlFor="confirmPassword">Confirm New Password</Label>
-              <Input
-                id="confirmPassword"
-                type="password"
-                value={passwordData.confirmPassword}
-                onChange={(e) => setPasswordData(prev => ({ ...prev, confirmPassword: e.target.value }))}
-                placeholder="Re-enter new password"
-              />
+              <div className="relative">
+                <Input
+                  id="confirmPassword"
+                  type={showConfirmPassword ? "text" : "password"}
+                  value={passwordData.confirmPassword}
+                  onChange={(e) => setPasswordData(prev => ({ ...prev, confirmPassword: e.target.value }))}
+                  placeholder="Re-enter new password"
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                  aria-label={showConfirmPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600"
+                >
+                  {showConfirmPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </div>
           </div>
           <DialogFooter className="gap-2 sm:gap-0">
@@ -414,19 +535,63 @@ export default function AdminProfile() {
               Cancel
             </Button>
             <Button
+              variant="primary"
+              data-primary-action
               onClick={handleChangePassword}
               disabled={!validatePassword(passwordData.newPassword).isValid || (passwordData.currentPassword === passwordData.newPassword && passwordData.currentPassword !== '')}
-              className={`${
-                validatePassword(passwordData.newPassword).isValid && !(passwordData.currentPassword === passwordData.newPassword && passwordData.currentPassword !== '')
-                  ? "bg-[#1D73EC] hover:bg-[#10316B] text-white"
-                  : "bg-gray-300 text-gray-500 cursor-not-allowed"
-              }`}
             >
               Change Password
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {showSuccessDialog && (
+        <Dialog open onOpenChange={setShowSuccessDialog}>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="text-[#10316B] flex items-center gap-2">
+                <CheckCircle className="w-5 h-5 text-emerald-500" /> Profile updated
+              </DialogTitle>
+              <DialogDescription>
+                Your profile has been updated successfully.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowSuccessDialog(false)}>
+                OK
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {showLogoutConfirm && (
+        <ConfirmationDialog
+          open
+          onOpenChange={setShowLogoutConfirm}
+          onConfirm={() => { logout(); setShowLogoutConfirm(false); }}
+          title="Sign out of Docufy?"
+          description="You'll need to sign in again to continue."
+          confirmLabel="Sign Out"
+          cancelLabel="Stay Signed In"
+          destructive={false}
+        />
+      )}
+
+      <AvatarCropDialog
+        open={cropSource !== null}
+        imageSrc={cropSource}
+        onOpenChange={(open) => {
+          if (!open) setCropSource(null);
+        }}
+        onApply={(cropped) => {
+          setProfileImage(cropped);
+          setCropSource(null);
+          toast.success('Photo ready — save to apply it.');
+        }}
+      />
+
     </Layout>
   );
 }

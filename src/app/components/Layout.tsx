@@ -14,20 +14,59 @@ import {
   Settings,
   ChevronLeft,
   ChevronRight,
-  ArrowLeft,
   AlertCircle,
-  Shield,
-  MapPin,
-  XCircle,
+  ArrowLeft,
+  Megaphone,
   Clock,
-  Upload,
+Home,
+  Boxes,
+  ArrowRight,
+  Calendar,
+  LifeBuoy,
+  Plus,
 } from "lucide-react";
 import { useAuth } from "../contexts/AuthContext";
-import logoImage from "figma:asset/32cd46dac3d06839e0db69b6c6ad22c9a8ac17a6.png";
-import { inventoryStore } from "../utils/inventoryStore";
+import { useLogo } from "../hooks/useLogo";
 import { notificationStore, type Notification } from "../utils/notificationStore";
-import { siemAlertStore, type SIEMAlert } from "../utils/siemAlertStore";
+import {
+  announcementsStore,
+  type Announcement,
+  ANNOUNCEMENT_TYPE_LABELS,
+  ANNOUNCEMENT_PRIORITY_LABELS,
+} from "../utils/announcementsStore";
 import { toast } from "sonner";
+import { useIsMobile } from "./ui/use-mobile";
+import { usePresence } from "./ui/use-presence";
+import { useMobileNav } from "../contexts/MobileNavContext";
+import { nowPHT, subscribeInternetTime, toPHT } from "../utils/pht";
+import { ConfirmationDialog } from "./ui/confirmation-dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "./ui/dialog";
+import { AnnouncementDetailsModal, type AnnouncementDetailData } from "./shared/AnnouncementDetailsModal";
+import HelpSupportDialog from "./shared/HelpSupportDialog";
+import { UnclaimedHeaderIndicator } from "./shared/UnclaimedHeaderIndicator";
+import { Button } from "./ui/button";
+import { TopProgressBar } from "./ui/top-progress-bar";
+import {
+  adminSections,
+  staffSections,
+  findActiveModule,
+  flattenSections,
+  resolveActiveChild,
+  type NavModule,
+  type NavSection,
+} from "../utils/navigationConfig";
+import {
+  snapshotExpandedParents,
+  persistExpandedParents,
+  ensureParentExpanded,
+} from "../utils/navExpandState";
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -39,7 +78,36 @@ interface LayoutProps {
   title?: string;
   showBackButton?: boolean;
   backButtonPath?: string;
+  hideMobileBackButton?: boolean;
+  headerSearch?: React.ReactNode;
 }
+
+// Persist the desktop sidebar's scroll position across route changes. Layout is
+// instantiated per-page (so it remounts on every navigation, resetting scroll);
+// this module-level value survives remounts so the sidebar stays put until the
+// user scrolls it themselves.
+let savedSidebarScrollTop = 0;
+
+// Which expandable parent was last active across Layout remounts (Layout is
+// instantiated per-page, so it remounts on every navigation). This drives the
+// parent's select animation: it should only replay when the user switches to a
+// DIFFERENT category (parent), not when picking another sub-option under the
+// same parent.
+let lastActiveCategoryPath: string | undefined;
+let pendingParentPulsePath: string | undefined;
+
+const NOTIF_TYPE_LABEL: Record<Notification["type"], string> = {
+  order: "Order",
+  payment: "Payment",
+  status_update: "Status Update",
+  inventory: "Inventory Alert",
+};
+
+const NOTIF_PRIORITY_LABEL = (p?: Notification["priority"]): string | undefined => {
+  if (p === "important") return "Important";
+  if (p === "emergency") return "Emergency";
+  return undefined;
+};
 
 export default function Layout({
   children,
@@ -47,18 +115,15 @@ export default function Layout({
   title,
   showBackButton = false,
   backButtonPath,
+  hideMobileBackButton = false,
+  headerSearch,
 }: LayoutProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useAuth();
-
-  const handleBack = () => {
-    if (backButtonPath) {
-      navigate(backButtonPath);
-    } else {
-      navigate(-1);
-    }
-  };
+  const isMobile = useIsMobile();
+  const { open: isMobileNavOpen, setOpen: setMobileNavOpen } = useMobileNav();
+  const logo = useLogo();
 
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(
     () => {
@@ -66,23 +131,197 @@ export default function Layout({
       return saved !== null ? JSON.parse(saved) : true;
     },
   );
+  const [isNavigationOpen, setIsNavigationOpen] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth >= 768 : false,
+  );
+  // Which parents have their inline submenu expanded. Kept as a Set so the
+  // active module can be auto-expanded without clobbering manual toggles. It
+  // reads from / writes to a module-level snapshot so a manually-opened parent
+  // stays expanded across route changes (Layout remounts per page).
+  const [expandedModules, setExpandedModules] = useState<Set<string>>(
+    () => snapshotExpandedParents(),
+  );
+  // Submenus expanded by a click during THIS Layout instance. Layout remounts on
+  // every navigation, so persisting this here (empty by default) means
+  // already-expanded parents don't replay their fade-in animation when the
+  // sidebar re-renders after navigating — only genuinely fresh expands animate.
+  const [animatedModules, setAnimatedModules] = useState<Set<string>>(
+    () => new Set(),
+  );
+  // Collapsed-sidebar tooltip: a single viewport-positioned label that follows
+  // the hovered item. Fixed to the icon's real coordinates so the name always
+  // sits right next to it (a plain `fixed left-[80px]` div with no vertical
+  // offset anchors to the element's static-flow position, which lands at the
+  // bottom instead of next to the icon being hovered).
+  const [sidebarTooltip, setSidebarTooltip] = useState<{ label: string; x: number; y: number } | null>(null);
+  const navRef = useRef<HTMLElement>(null);
+  // A single delayed tooltip scheduler for the collapsed sidebar (nav icons)
+  // so names never flash on a quick mouse pass — they appear only after a
+  // longer, deliberate hold.
+  const tooltipTimerRef = useRef<number | null>(null);
 
-  const [isProfileOpen, setIsProfileOpen] = useState(false);
+  const scheduleSidebarTooltip = (
+    label: string,
+    e: React.MouseEvent<HTMLElement> | React.FocusEvent<HTMLElement>,
+    delayMs: number,
+  ) => {
+    if (isMobile) return;
+    const itemRect = e.currentTarget.getBoundingClientRect();
+    // Anchor the tooltip to the sidebar's RIGHT edge (not the hovered icon), so
+    // it always floats fully OUTSIDE the bar — and it hugs the edge whether the
+    // sidebar sits at its collapsed (72px) or expanded (256px) width.
+    const asideRect = e.currentTarget.closest("aside")?.getBoundingClientRect();
+    const x = (asideRect?.right ?? itemRect.right) + 12;
+    const y = itemRect.top + itemRect.height / 2;
+    if (tooltipTimerRef.current !== null) window.clearTimeout(tooltipTimerRef.current);
+    tooltipTimerRef.current = window.setTimeout(() => {
+      tooltipTimerRef.current = null;
+      setSidebarTooltip({ label, x, y });
+    }, delayMs);
+  };
+
+  // Nav-icon tooltips in the collapsed sidebar — delayed, longer hold.
+  const showSidebarTooltip = (
+    label: string,
+    e: React.MouseEvent<HTMLElement> | React.FocusEvent<HTMLElement>,
+  ) => {
+    if (isSidebarExpanded) return;
+    scheduleSidebarTooltip(label, e, 600);
+  };
+
+  const hideSidebarTooltip = () => {
+    if (tooltipTimerRef.current !== null) window.clearTimeout(tooltipTimerRef.current);
+    tooltipTimerRef.current = null;
+    setSidebarTooltip(null);
+  };
+
+  // Restore the desktop sidebar scroll position after this Layout instance
+  // remounts on navigation.
+  useEffect(() => {
+    if (navRef.current) {
+      navRef.current.scrollTop = savedSidebarScrollTop;
+    }
+    return () => {
+      if (tooltipTimerRef.current !== null) window.clearTimeout(tooltipTimerRef.current);
+    };
+  }, []);
+
+  // On mobile the page scrolls with the document (body) so the whole page
+  // scrolls as ONE continuous stream. SPA navigation keeps the window scroll
+  // position across pages, so reset to the top on every Layout mount (Layout is
+  // instantiated per-page). Desktop never scrolls the window (inner scroller),
+  // so this is a no-op there.
+  useEffect(() => {
+    if (isMobile) window.scrollTo(0, 0);
+  }, [isMobile]);
+
+  // Phones never hover, so the customer's press feedback (tailwind.css) is
+  // switched on for customer sessions only through this attribute.
+  useEffect(() => {
+    if (user?.role !== "customer") return;
+    document.documentElement.setAttribute("data-mobile-press", "customer");
+    return () => document.documentElement.removeAttribute("data-mobile-press");
+  }, [user?.role]);
+
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [isTopProfileOpen, setIsTopProfileOpen] = useState(false);
   const [isNotificationOpen, setIsNotificationOpen] =
     useState(false);
-  const [isSIEMOpen, setIsSIEMOpen] = useState(false);
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const topProfileRef = useRef<HTMLDivElement>(null);
+
+  // Close the header profile dropdown when clicking outside of it.
+  useEffect(() => {
+    if (!isTopProfileOpen) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        topProfileRef.current &&
+        !topProfileRef.current.contains(event.target as Node)
+      ) {
+        setIsTopProfileOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [isTopProfileOpen]);
+
+  // Live header clock — real internet GMT+8 (Philippines time), visible to
+  // every user/role on every page through the shared Layout header.
+  const [headerNow, setHeaderNow] = useState(() => nowPHT());
+  useEffect(() => {
+    const tick = () => setHeaderNow(nowPHT());
+    const id = setInterval(tick, 1000);
+    // Re-render once the internet time resolves so the clock snaps to true GMT+8.
+    const unsubscribe = subscribeInternetTime(tick);
+    return () => {
+      clearInterval(id);
+      unsubscribe();
+    };
+  }, []);
+  const headerWeekday = headerNow.toLocaleDateString("en-PH", { weekday: "long" });
+  const headerDate = headerNow.toLocaleDateString("en-PH", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+  const headerTimeStr = headerNow.toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  // Keep panels mounted while animating closed
+  const topProfilePresence = usePresence(isTopProfileOpen, 200);
+  const notificationPresence = usePresence(isNotificationOpen, 200);
 
   // Track notifications
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
 
-  // Track SIEM alerts (admin only)
-  const [siemAlerts, setSiemAlerts] = useState<SIEMAlert[]>([]);
-  const [siemUnreadCount, setSiemUnreadCount] = useState(0);
-  const [siemCriticalCount, setSiemCriticalCount] = useState(0);
+  // Track announcements (merged into the bell dropdown alongside notifications)
+  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
 
-  // Track low inventory items
-  const [lowInventoryItems, setLowInventoryItems] = useState<string[]>([]);
+  // Track announcements unread (sidebar badge)
+  const [unreadAnnouncements, setUnreadAnnouncements] = useState(0);
+
+  // Detail view opened from the bell dropdown — shows full content first, marks
+  // read on view, and (when the item has a destination) offers an action button.
+  type BellDetail = {
+    kind: "notification" | "announcement";
+    title: string;
+    message: string;
+    timestamp: Date;
+    typeLabel?: string;
+    priorityLabel?: string;
+    priority?: Notification["priority"];
+    icon: React.ComponentType<{ className?: string }>;
+    color: string;
+    action?: { label: string; run: () => void } | null;
+  };
+  const [selectedDetail, setSelectedDetail] = useState<BellDetail | null>(null);
+
+  const formatDetailTime = (date: Date) => {
+    const pht = toPHT(date);
+    const opts: Intl.DateTimeFormatOptions = {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    };
+    return pht.toLocaleString("en-US", opts);
+  };
+
+  useEffect(() => {
+    const updateAnnouncements = () => {
+      setUnreadAnnouncements(announcementsStore.getUnreadCount(user?.email ?? "", user?.role));
+    };
+    updateAnnouncements();
+    const unsubscribe = announcementsStore.subscribe(updateAnnouncements);
+    return unsubscribe;
+  }, [user?.email, user?.role]);
 
   useEffect(() => {
     localStorage.setItem(
@@ -104,40 +343,28 @@ export default function Layout({
     return unsubscribe;
   }, [user?.role, user?.email]);
 
-  // Subscribe to SIEM alerts (admin only)
+  // Subscribe to announcements and merge them into the bell dropdown
   useEffect(() => {
-    if (user?.role !== 'admin') {
-      return;
-    }
-
-    const updateSIEMAlerts = () => {
-      const alerts = siemAlertStore.getAlerts(user?.role);
-      setSiemAlerts(alerts);
-      setSiemUnreadCount(siemAlertStore.getUnreadCount(user?.role));
-      setSiemCriticalCount(siemAlertStore.getCriticalUnreadCount(user?.role));
+    const updateAnnouncements = () => {
+      const list = announcementsStore.getAnnouncementsFor(user?.email || "", user?.role);
+      setAnnouncements(list);
     };
-
-    updateSIEMAlerts();
-    const unsubscribe = siemAlertStore.subscribe(updateSIEMAlerts);
+    updateAnnouncements();
+    const unsubscribe = announcementsStore.subscribe(updateAnnouncements);
     return unsubscribe;
-  }, [user?.role]);
+  }, [user?.email, user?.role]);
 
-  // Check for low inventory items (threshold: 100 for paper, 10 for supplies)
-  useEffect(() => {
-    const checkInventory = () => {
-      const items = inventoryStore.getItems();
-      const lowItems = items.filter(item => {
-        if (item.archived) return false;
-        const threshold = item.category === 'Paper' ? 100 : 10;
-        return item.currentStock <= threshold;
-      }).map(item => item.itemName);
-      setLowInventoryItems(lowItems);
-    };
+  const getInitials = (value?: string) => {
+    if (!value) return "U";
+    const letters = value.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? "").join("");
+    return letters || "U";
+  };
 
-    checkInventory();
-    const unsubscribe = inventoryStore.subscribe(checkInventory);
-    return unsubscribe;
-  }, []);
+  // Avatars live ONLY in Supabase (profiles.profile_image_path -> user.profileImage).
+  // Any legacy localStorage avatar keys were purged at boot, so the sidebar and
+  // header always reflect the signed-in account's persisted picture.
+  const profileImage = user?.profileImage;
+  const profileInitial = getInitials(user?.name || user?.email || "User");
 
   const displayTitle =
     title ||
@@ -145,92 +372,349 @@ export default function Layout({
       ?.label ||
     "Dashboard";
 
+  // SPA route changes are silent to assistive tech by default: the tab title
+  // never changed and focus stayed on the link that was clicked (F09). On every
+  // page change we name the tab and move focus to the main region so
+  // keyboard/screen-reader users start at the new content instead of the
+  // previous page's nav.
+  const mainRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    document.title = `${displayTitle} · Docufy PSMS`;
+    const id = window.setTimeout(() => {
+      mainRef.current?.focus({ preventScroll: true });
+    }, 0);
+    return () => window.clearTimeout(id);
+  }, [location.pathname, displayTitle]);
+
+  useEffect(() => {
+    setIsNavigationOpen(!isMobile);
+  }, [isMobile]);
+
+  const handleNavigation = (path: string) => {
+    lastActiveCategoryPath = undefined;
+    pendingParentPulsePath = undefined;
+    navigate(path);
+  };
+
+  // Selecting a sub-option: pulse the parent's select animation ONLY when this
+  // sub-option belongs to a different category than the last one used.
+  const handleChildNavigation = (module: NavModule, childPath: string) => {
+    if (module.path !== lastActiveCategoryPath) {
+      pendingParentPulsePath = module.path;
+      lastActiveCategoryPath = module.path;
+    }
+    navigate(childPath);
+  };
+
+  // Capture the pending parent pulse for THIS instance's initial render, then
+  // clear it so the next instance doesn't replay it. Clearing post-mount keeps
+  // the animate-in class applied long enough for the CSS animation to play.
+  const pulseParentPath = pendingParentPulsePath;
+
+  useEffect(() => {
+    pendingParentPulsePath = undefined;
+  }, []);
+
+  const customerModules: NavModule[] = menuItems.map((item) => ({
+      label: item.label,
+      path: item.path,
+      icon: item.icon,
+    }));
+
+  const allModules: NavModule[] =
+    user?.role === "admin"
+      ? flattenSections(adminSections)
+      : user?.role === "staff"
+        ? flattenSections(staffSections)
+        : customerModules;
+
+  // Sectioned groups for the admin/staff sidebar (WORK / TEAM / SETTINGS).
+  // Customers keep the legacy flat menu (no headings).
+  const sections: NavSection[] =
+    user?.role === "admin"
+      ? adminSections
+      : user?.role === "staff"
+        ? staffSections
+        : [];
+
+  // Walk-in is the one create action in the rail, so it lives pinned under the
+  // brand instead of taking a nav row that would be indistinguishable from a
+  // destination.
+  const walkInPath = user ? `/${user.role}/walk-in` : "";
+  const isWalkInActive = !!user && location.pathname === walkInPath;
+
+  const activeModule = findActiveModule(
+    allModules,
+    location.pathname,
+    location.search,
+  );
+  const showLabels = isMobile || isSidebarExpanded;
+
+  // Always keep the parent of the current route expanded so navigation state
+  // matches the URL (auto-expands after navigating straight to a child).
+  useEffect(() => {
+    if (activeModule?.children?.length) {
+      ensureParentExpanded(activeModule.path);
+      setExpandedModules((prev) =>
+        prev.has(activeModule.path)
+          ? prev
+          : new Set(prev).add(activeModule.path),
+      );
+    }
+  }, [activeModule?.path, location.pathname, location.search]);
+
+  const isModuleExpanded = (module: NavModule) =>
+    !!module.children && expandedModules.has(module.path);
+
+  // Parent row click: leaf items navigate; parents toggle their inline submenu.
+  // In the collapsed (icon-only) sidebar, clicking a parent expands the whole
+  // sidebar first so the submenu has room to show (mirrors the profile button).
+  const toggleModule = (module: NavModule) => {
+    if (!module.children?.length) {
+      handleNavigation(module.path);
+      return;
+    }
+    if (!isMobile && !isSidebarExpanded) {
+      setIsSidebarExpanded(true);
+      setExpandedModules((prev) => {
+        const next = new Set(prev);
+        next.add(module.path);
+        persistExpandedParents(next);
+        return next;
+      });
+      setAnimatedModules((prev) => new Set(prev).add(module.path));
+      return;
+    }
+    setExpandedModules((prev) => {
+      const next = new Set(prev);
+      if (next.has(module.path)) next.delete(module.path);
+      else next.add(module.path);
+      persistExpandedParents(next);
+      return next;
+    });
+    setAnimatedModules((prev) => {
+      const next = new Set(prev);
+      if (next.has(module.path)) next.delete(module.path);
+      else next.add(module.path);
+      return next;
+    });
+  };
+
+  // Renders a single nav row (leaf or expandable parent with inline submenu).
+  // Used inside collapsible sections (admin/staff) and the flat menu (customer).
+  const renderModuleItem = (module: NavModule) => {
+    const isActive = activeModule === module;
+    const hasChildren = !!module.children && module.children.length > 0;
+    const isExpanded = isModuleExpanded(module);
+    return (
+      <div key={module.path} className={`relative group w-full flex flex-col px-3 ${showLabels ? "items-stretch" : "items-center"}`}>
+        <button
+          type="button"
+          onClick={() => toggleModule(module)}
+          onMouseEnter={(e) => showSidebarTooltip(module.label, e)}
+          onMouseLeave={hideSidebarTooltip}
+          onFocus={(e) => showSidebarTooltip(module.label, e)}
+          onBlur={hideSidebarTooltip}
+          aria-current={isActive ? "page" : undefined}
+          aria-expanded={hasChildren ? isExpanded : undefined}
+          className={`flex items-center transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]/40 active:scale-[0.97] ${
+            showLabels ? "w-full px-4 py-3 gap-3.5" : "w-11 h-11 justify-center rounded-xl"
+          } ${
+            isActive && hasChildren && showLabels
+              ? `rounded-lg bg-[#F2F7FF] text-[#1668D9] shadow-[0_2px_8px_rgba(16,49,107,0.16)] ring-1 ring-inset ring-[#DCE8FB]${pulseParentPath === module.path ? " animate-in fade-in duration-200" : ""}`
+              : isActive
+                ? "rounded-xl bg-white text-[#1668D9] shadow-lg animate-in fade-in duration-200"
+                : "rounded-xl text-white/90 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          <div className="relative flex-shrink-0 flex items-center justify-center">
+            {module.icon}
+          </div>
+          <span className={`text-sm font-semibold whitespace-nowrap overflow-hidden truncate ${showLabels ? "max-w-[200px] opacity-100" : "max-w-0 opacity-0 transition-all duration-300"}`}>
+            {module.label}
+          </span>
+          {hasChildren && showLabels && (
+            <span className="ml-auto flex-shrink-0 flex items-center justify-center">
+              {isExpanded ? (
+                <ChevronDown className="w-4 h-4 opacity-80" />
+              ) : (
+                <ChevronRight className="w-4 h-4 opacity-80" />
+              )}
+            </span>
+          )}
+          {isActive && !hasChildren && showLabels && <div className="ml-auto w-1.5 h-1.5 rounded-full bg-[#1668D9]" />}
+        </button>
+
+        {hasChildren && isExpanded && showLabels && (
+          <div className={`relative flex flex-col items-stretch w-full mt-1.5 ${animatedModules.has(module.path) ? "animate-in fade-in slide-in-from-top-1 duration-150" : ""}`}>
+            <span
+              aria-hidden="true"
+              className="absolute left-[30px] top-1 bottom-1 w-[2px] rounded-full bg-white/30 pointer-events-none"
+            />
+            <div className="flex flex-col items-stretch gap-1.5">
+              {module.children!.map((child) => {
+                const isChildActive =
+                  resolveActiveChild(
+                    module.children!,
+                    location.pathname,
+                    location.search,
+                  )?.path === child.path;
+                return (
+                  <button
+                    key={child.path}
+                    type="button"
+                    onClick={() => handleChildNavigation(module, child.path)}
+                    onMouseEnter={(e) => showSidebarTooltip(child.label, e)}
+                    onMouseLeave={hideSidebarTooltip}
+                    onFocus={(e) => showSidebarTooltip(child.label, e)}
+                    onBlur={hideSidebarTooltip}
+                    aria-current={isChildActive ? "page" : undefined}
+                    className={`relative ml-[32px] flex items-center pl-5 pr-3 py-1.5 rounded-lg text-[13px] transition-all duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]/40 active:scale-[0.97] ${
+                      isChildActive
+                        ? "bg-white/15 text-white font-semibold shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_1px_2px_rgba(13,49,115,0.15)] ring-1 ring-inset ring-white/10 animate-in fade-in duration-200"
+                        : "text-white/80 font-medium hover:bg-white/10 hover:text-white"
+                    }`}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={`absolute top-1/2 -translate-y-1/2 left-[-5px] h-2 w-2 rounded-full transition-colors duration-200 ${
+                        isChildActive
+                          ? "bg-white shadow-[0_0_8px_rgba(255,255,255,0.55)] animate-in fade-in zoom-in-75 duration-200"
+                          : "border border-white/45 bg-white/5"
+                      }`}
+                    />
+                    <span className="truncate">{child.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   const handleLogout = () => {
+    setShowLogoutConfirm(true);
+  };
+
+  const confirmLogout = () => {
     logout();
     navigate("/");
   };
 
   const handleNotificationClick = (notification: Notification) => {
-    // Mark as read
-    notificationStore.markAsRead(notification.id);
-
-    setIsNotificationOpen(false);
-
-    // Navigate if clickable
-    if (notification.clickable && notification.relatedRoute) {
-      navigate(notification.relatedRoute);
-    } else if (notification.clickable && notification.relatedOrderId && user) {
-      // Navigate to order tracking
+    // Navigate to the notification's destination (called from the detail view's action button).
+    if (notification.type === 'inventory' && user) {
+      navigate(user.role === 'staff' ? '/staff/inventory' : '/admin/inventory');
+      return;
+    }
+    if (notification.relatedOrderId && user) {
       if (user.role === 'customer') {
         navigate(`/customer/track/${notification.relatedOrderId}`);
       } else {
-        navigate(`/${user.role}/orders`);
+        // Admin/staff: go to the Orders list and open the customer's order right away.
+        navigate(`/${user.role}/orders?orderId=${encodeURIComponent(notification.relatedOrderId)}`);
       }
+      return;
     }
+    if (notification.relatedRoute) navigate(notification.relatedRoute);
+  };
+
+  const openNotificationDetail = (notification: Notification) => {
+    // Mark read only once it is opened/viewed — never before.
+    notificationStore.markAsRead(notification.id);
+    const meta = getNotificationIcon(notification.type, notification.priority);
+    const hasDestination =
+      (notification.type === 'inventory' && !!user) ||
+      (!!notification.relatedOrderId && !!user) ||
+      !!notification.relatedRoute;
+    setSelectedDetail({
+      kind: 'notification',
+      title: notification.title,
+      message: notification.message,
+      timestamp: notification.timestamp,
+      typeLabel: NOTIF_TYPE_LABEL[notification.type],
+      priorityLabel: NOTIF_PRIORITY_LABEL(notification.priority),
+      priority: notification.priority,
+      icon: meta.icon,
+      color: meta.color,
+      action: hasDestination
+        ? {
+            label:
+              notification.type === 'inventory'
+                ? 'View Inventory'
+                : notification.relatedOrderId
+                  ? 'View Order'
+                  : 'Go to Page',
+            run: () => {
+              setSelectedDetail(null);
+              setIsNotificationOpen(false);
+              handleNotificationClick(notification);
+            },
+          }
+        : null,
+    });
   };
 
   const handleMarkAllRead = () => {
     notificationStore.markAllAsRead(user?.role, user?.email);
+    announcementsStore.markAllRead(user?.email || "");
     toast.success('All notifications marked as read');
   };
 
-  const handleSIEMAlertClick = (alert: SIEMAlert) => {
-    siemAlertStore.markAsRead(alert.id);
-    setIsSIEMOpen(false);
-    if (alert.investigateUrl) {
-      navigate(alert.investigateUrl);
+  // "Show All Notifications" in the bell dropdown → the full notification page
+  // (the one previously reached via the sidebar Notifications tab, still routed).
+  const handleShowAllNotifications = () => {
+    setIsNotificationOpen(false);
+    if (user) navigate(`/${user.role}/notifications`);
+  };
+
+  const openAnnouncementDetail = (announcement: Announcement) => {
+    // Mark read only once it is opened/viewed — never before.
+    announcementsStore.markRead(announcement.id, user?.email || "");
+    const meta =
+      announcement.priority === "emergency"
+        ? { icon: AlertTriangle, color: "bg-red-100 text-red-600", unreadDot: "bg-red-500" }
+        : announcement.priority === "important"
+          ? { icon: AlertTriangle, color: "bg-amber-100 text-amber-600", unreadDot: "bg-amber-500" }
+          : { icon: Megaphone, color: "bg-blue-100 text-blue-600", unreadDot: "bg-blue-500" };
+    setSelectedDetail({
+      kind: 'announcement',
+      title: announcement.title,
+      message: announcement.message,
+      timestamp: new Date(announcement.sentAt),
+      typeLabel: ANNOUNCEMENT_TYPE_LABELS[announcement.type],
+      priorityLabel: ANNOUNCEMENT_PRIORITY_LABELS[announcement.priority],
+      priority:
+        announcement.priority === 'emergency'
+          ? 'emergency'
+          : announcement.priority === 'important'
+            ? 'important'
+            : undefined,
+      icon: meta.icon,
+      color: meta.color,
+      action: null,
+    });
+  };
+
+  const getNotificationIcon = (type: Notification['type'], priority?: Notification['priority']) => {
+    if (type === 'inventory') {
+      // Out of Stock → emergency/red; Low Stock → important/amber.
+      return priority === 'emergency'
+        ? { icon: AlertTriangle, color: 'bg-red-100 text-red-600', unreadDot: 'bg-red-500' }
+        : { icon: Boxes, color: 'bg-amber-100 text-amber-600', unreadDot: 'bg-amber-500' };
     }
-  };
-
-  const handleMarkAllSIEMRead = () => {
-    siemAlertStore.markAllAsRead(user?.role);
-    toast.success('All security alerts marked as read');
-  };
-
-  const getSIEMAlertIcon = (type: SIEMAlert['type']) => {
-    switch (type) {
-      case 'impossible_travel':
-        return { icon: MapPin, color: 'bg-red-100 text-red-600' };
-      case 'brute_force':
-        return { icon: AlertTriangle, color: 'bg-red-100 text-red-600' };
-      case 'suspicious_upload':
-        return { icon: Upload, color: 'bg-yellow-100 text-yellow-600' };
-      case 'unusual_access':
-        return { icon: Clock, color: 'bg-yellow-100 text-yellow-600' };
-      case 'repeated_failures':
-        return { icon: XCircle, color: 'bg-orange-100 text-orange-600' };
-      default:
-        return { icon: AlertTriangle, color: 'bg-gray-100 text-gray-600' };
-    }
-  };
-
-  const getSIEMSeverityBadge = (severity: SIEMAlert['severity']) => {
-    switch (severity) {
-      case 'critical':
-        return 'bg-red-100 text-red-700 border-red-200';
-      case 'high':
-        return 'bg-orange-100 text-orange-700 border-orange-200';
-      case 'medium':
-        return 'bg-yellow-100 text-yellow-700 border-yellow-200';
-      case 'low':
-        return 'bg-blue-100 text-blue-700 border-blue-200';
-      default:
-        return 'bg-gray-100 text-gray-700 border-gray-200';
-    }
-  };
-
-  const getNotificationIcon = (type: Notification['type']) => {
     switch (type) {
       case 'order':
-        return { icon: PackageIcon, color: 'bg-green-100 text-green-600' };
+        return { icon: PackageIcon, color: 'bg-blue-100 text-blue-600', unreadDot: 'bg-blue-500' };
       case 'payment':
-        return { icon: AlertTriangle, color: 'bg-yellow-100 text-yellow-600' };
-      case 'inventory':
-        return { icon: AlertCircle, color: 'bg-red-100 text-red-600' };
+        return { icon: AlertTriangle, color: 'bg-yellow-100 text-yellow-600', unreadDot: 'bg-yellow-500' };
       case 'status_update':
-        return { icon: CheckCircle, color: 'bg-blue-100 text-blue-600' };
+        return { icon: CheckCircle, color: 'bg-blue-100 text-blue-600', unreadDot: 'bg-blue-500' };
       default:
-        return { icon: Bell, color: 'bg-gray-100 text-gray-600' };
+        return { icon: Bell, color: 'bg-gray-100 text-gray-600', unreadDot: 'bg-blue-500' };
     }
   };
 
@@ -247,317 +731,440 @@ export default function Layout({
     return `${days}d ago`;
   };
 
-  return (
-    <div className="min-h-screen bg-[#f0f4f8] flex font-poppins overflow-hidden">
-      {/* ─── SIDEBAR (Gradient removed, solid blue restored) ─── */}
-      <aside
-        className={`bg-[#1D73EC] flex flex-col z-50 shadow-2xl transition-all duration-300 ease-in-out flex-shrink-0 relative ${
-          isSidebarExpanded ? "w-64" : "w-[72px]"
-        }`}
-      >
-        {/* Brand / Logo */}
-        <div className="pt-5 pb-3 w-full">
-          <div className="flex items-center justify-center">
-            <img
-              src={logoImage}
-              alt="DocuFy Logo"
-              className="w-10 h-10 rounded-full bg-white/10 p-0.5 shadow-lg flex-shrink-0"
-            />
-          </div>
-        </div>
+  // Combined unread count = order/payment notifications + announcements
+  const combinedUnread = unreadCount + unreadAnnouncements;
 
-        {/* Toggle Button Section - Arrow Only & High Visibility Lines */}
-        <div className="my-2 px-3">
-          <div className="h-[2px] bg-white/40 w-full mb-4 shadow-sm" />
-          <div className="flex justify-center">
-            <button
-              onClick={() =>
-                setIsSidebarExpanded(!isSidebarExpanded)
+  // Merge announcements and order/payment notifications into one chronological
+  // feed for the bell dropdown so both kinds show in the same list.
+  type BellItem = {
+    key: string;
+    read: boolean;
+    title: string;
+    message: string;
+    timestamp: Date;
+    icon: React.ComponentType<{ className?: string }>;
+    color: string;
+    unreadDot: string;
+    onClick: () => void;
+    clickable: boolean;
+  };
+
+  const bellItems: BellItem[] = [
+    ...announcements.map((a) => {
+      const read = a.readBy.includes(user?.email || "");
+      const meta =
+        a.priority === "emergency"
+          ? { icon: AlertTriangle, color: "bg-red-100 text-red-600", unreadDot: "bg-red-500" }
+          : a.priority === "important"
+            ? { icon: AlertTriangle, color: "bg-amber-100 text-amber-600", unreadDot: "bg-amber-500" }
+            : { icon: Megaphone, color: "bg-blue-100 text-blue-600", unreadDot: "bg-blue-500" };
+      return {
+        key: a.id,
+        read,
+        title: a.title,
+        message: a.message,
+        timestamp: new Date(a.sentAt),
+        icon: meta.icon,
+        color: meta.color,
+        unreadDot: meta.unreadDot,
+        onClick: () => openAnnouncementDetail(a),
+        clickable: true,
+      };
+    }),
+    ...notifications.map((n) => {
+      const meta = getNotificationIcon(n.type, n.priority);
+      return {
+        key: n.id,
+        read: n.read,
+        title: n.title,
+        message: n.message,
+        timestamp: n.timestamp,
+        icon: meta.icon,
+        color: meta.color,
+        unreadDot: meta.unreadDot,
+        onClick: () => openNotificationDetail(n),
+        clickable: n.clickable,
+      };
+    }),
+  ].sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+  const navigation = (
+    <>
+      <div className="pt-4 pb-2 w-full">
+        <div className="relative h-10">
+          <button
+            type="button"
+            onClick={() => {
+              if (!isMobile && !isSidebarExpanded) {
+                setIsSidebarExpanded(true);
               }
-              className={`flex items-center rounded-xl transition-all duration-200 group relative ${
-                isSidebarExpanded
-                  ? "w-full px-3 py-2.5 gap-3"
-                  : "w-10 h-10 justify-center"
-              } text-blue-100 hover:bg-white/10 hover:text-white`}
+            }}
+            aria-label="Docufy"
+            className="group relative absolute top-0 left-4 w-10 h-10 flex items-center rounded-xl cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
+          >
+            <img
+              src={logo}
+              alt=""
+              className={`w-10 h-10 rounded-full bg-white/10 p-0.5 shadow-lg flex-shrink-0 transition-opacity duration-200 ${showLabels ? "" : "group-hover:opacity-0"}`}
+            />
+            <span
+              className={`absolute inset-0 z-10 flex items-center justify-center pointer-events-none transition-opacity duration-200 ${showLabels ? "hidden" : "opacity-0 group-hover:opacity-100"}`}
             >
-              <div className="flex-shrink-0">
-                {isSidebarExpanded ? (
-                  <ChevronLeft className="w-5 h-5" />
-                ) : (
-                  <ChevronRight className="w-5 h-5" />
-                )}
-              </div>
-              {isSidebarExpanded && (
-                <span className="text-sm font-medium">
-                  Collapse
-                </span>
-              )}
+              <ChevronRight className="w-5 h-5 text-white" strokeWidth={2.5} />
+            </span>
+            <span
+              className={`absolute left-[52px] top-1/2 -translate-y-1/2 text-lg font-bold tracking-tight text-white whitespace-nowrap pointer-events-none transition-opacity duration-300 ${showLabels ? "opacity-100" : "opacity-0"}`}
+            >
+              Docufy
+            </span>
+          </button>
 
-              {/* Tooltip for Toggle Button */}
-              {!isSidebarExpanded && (
-                <div className="fixed left-[80px] px-3 py-1.5 bg-[#1c1f26] text-white text-xs font-medium rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity duration-150 z-[9999] whitespace-nowrap border border-white/10">
-                  Open Sidebar
-                  <div className="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-[#1c1f26]" />
-                </div>
-              )}
+          {showLabels && (
+            <button
+              type="button"
+              onClick={() => {
+                if (isMobile) {
+                  setIsNavigationOpen(false);
+                } else {
+                  setIsSidebarExpanded(!isSidebarExpanded);
+                }
+              }}
+              aria-label={isMobile ? "Close navigation" : "Collapse navigation"}
+              aria-expanded={isMobile ? isNavigationOpen : isSidebarExpanded}
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-7 w-7 items-center justify-center rounded-full text-blue-100 transition-colors duration-200 hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+            >
+              <ChevronLeft className="w-4 h-4" strokeWidth={2.5} />
             </button>
-          </div>
-          <div className="h-[2px] bg-white/40 w-full mt-4 shadow-sm" />
+          )}
         </div>
+      </div>
 
-        {/* Navigation */}
-        <nav className="flex-1 py-5 space-y-2 overflow-y-auto custom-scrollbar flex flex-col items-center">
-          {menuItems.map((item) => {
-            const isActive = location.pathname === item.path;
-            return (
-              <div
-                key={item.path}
-                className="relative group w-full flex justify-center px-3"
-              >
-                <button
-                  onClick={() => navigate(item.path)}
-                  className={`flex items-center transition-all duration-200 ${
-                    isSidebarExpanded
-                      ? "w-full px-4 py-3 gap-3.5 rounded-xl"
-                      : "w-11 h-11 justify-center rounded-xl"
-                  } ${
-                    isActive
-                      ? "bg-white text-[#1D73EC] shadow-lg"
-                      : "text-blue-100 hover:bg-white/10 hover:text-white"
-                  }`}
+      <div className="px-3 mb-2">
+        <div className="h-[2px] bg-white/40 w-full" />
+      </div>
+
+      {/* Pinned create action — outside the scroller so it never scrolls away.
+          White-on-blue alone reads like a selected nav row, so it carries its own
+          group heading, a filled plus chip and a travelling chevron: a button,
+          not a destination. */}
+      {user && user.role !== "customer" && (
+        <div className="w-full px-3 pb-1">
+          {showLabels && (
+            <div
+              aria-hidden="true"
+              className="px-3 pt-1 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-blue-100/70 select-none"
+            >
+              Actions
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => handleNavigation(walkInPath)}
+            onMouseEnter={(event) => showSidebarTooltip("New walk-in", event)}
+            onMouseLeave={hideSidebarTooltip}
+            onFocus={(event) => showSidebarTooltip("New walk-in", event)}
+            onBlur={hideSidebarTooltip}
+            aria-label="New walk-in transaction"
+            aria-current={isWalkInActive ? "page" : undefined}
+            className={`group flex items-center rounded-xl bg-white text-[#1668D9] shadow-[0_2px_8px_rgba(9,32,74,0.3)] transition-all duration-200 hover:bg-[#EAF2FF] active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/60 ${
+              showLabels ? "w-full gap-3.5 py-2.5 pr-4 pl-4" : "mx-auto h-11 w-11 justify-center"
+            } ${isWalkInActive ? "ring-2 ring-white/70" : ""}`}
+          >
+            {showLabels ? (
+              <>
+                <span
+                  aria-hidden="true"
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#1668D9] text-white"
                 >
-                  <div className="flex-shrink-0 flex items-center justify-center">
-                    {item.icon}
-                  </div>
-                  {isSidebarExpanded && (
-                    <span className="text-sm font-medium whitespace-nowrap truncate">
-                      {item.label}
-                    </span>
-                  )}
-                  {isActive && isSidebarExpanded && (
-                    <div className="ml-auto w-1.5 h-1.5 rounded-full bg-[#1D73EC]" />
-                  )}
-                </button>
+                  <Plus className="h-3.5 w-3.5" strokeWidth={3} />
+                </span>
+                <span className="text-sm font-semibold whitespace-nowrap">New walk-in</span>
+                <ChevronRight
+                  aria-hidden="true"
+                  className="ml-auto h-4 w-4 shrink-0 text-[#1668D9]/45 transition-transform duration-200 group-hover:translate-x-0.5 group-hover:text-[#1668D9]"
+                />
+              </>
+            ) : (
+              <Plus className="h-5 w-5 shrink-0" strokeWidth={2.5} />
+            )}
+          </button>
+        </div>
+      )}
 
-                {/* Fixed Tooltip for Tab Names */}
-                {!isSidebarExpanded && (
-                  <div className="fixed left-[80px] px-3 py-1.5 bg-[#1c1f26] text-white text-xs font-medium rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity duration-150 z-[9999] whitespace-nowrap border border-white/10">
-                    {item.label}
-                    <div className="absolute right-full top-1/2 -translate-y-1/2 border-4 border-transparent border-r-[#1c1f26]" />
+      <nav
+        ref={navRef}
+        onScroll={(e) => {
+          savedSidebarScrollTop = e.currentTarget.scrollTop;
+          hideSidebarTooltip();
+        }}
+        aria-label="Primary navigation"
+        className="flex-1 pt-1.5 pb-5 space-y-2 overflow-y-auto custom-scrollbar flex flex-col items-center"
+      >
+        {showLabels ? (
+          <div className="flex flex-col items-stretch w-full">
+            {sections.length > 0 ? (
+              sections.map((section) => (
+                <div key={section.key} className="flex flex-col items-stretch w-full">
+                  <div
+                    aria-hidden="true"
+                    className="px-6 pt-3 pb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-blue-100/70 select-none"
+                  >
+                    {section.label}
                   </div>
-                )}
+                  <div className="flex flex-col space-y-1.5">
+                    {section.items.map(renderModuleItem)}
+                  </div>
+                </div>
+              ))
+            ) : (
+              allModules.map(renderModuleItem)
+            )}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center w-full space-y-2">
+            {allModules.map(renderModuleItem)}
+          </div>
+        )}
+      </nav>
+
+      {/* Footer: the way out, and the way to ask for help. Help & Support is
+          staff/customer only — an admin's contact details are the shop's own.
+          Sign out sits here as a plain row, the same shape as the row above it;
+          the profile block lives in the header avatar menu, not in the rail. */}
+      <div className="mt-auto w-full px-3 pb-5">
+        <div className="h-[2px] bg-white/40 w-full mb-3" />
+
+        {user?.role !== "admin" && (
+          <button
+            type="button"
+            onClick={() => {
+              setIsHelpOpen(true);
+              hideSidebarTooltip();
+            }}
+            onMouseEnter={(event) => showSidebarTooltip("Help & Support", event)}
+            onMouseLeave={hideSidebarTooltip}
+            onFocus={(event) => showSidebarTooltip("Help & Support", event)}
+            onBlur={hideSidebarTooltip}
+            aria-label="Open Help & Support"
+            aria-haspopup="dialog"
+            className={`flex items-center gap-3 rounded-xl text-blue-100 transition-all hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 ${
+              showLabels ? "w-full px-3 py-2.5" : "mx-auto h-11 w-11 justify-center"
+            }`}
+          >
+            <LifeBuoy className="w-5 h-5 shrink-0" />
+            {showLabels && (
+              <div className="min-w-0 flex-1 text-left">
+                <p className="text-sm font-semibold text-white leading-none">Help &amp; Support</p>
               </div>
-            );
-          })}
-        </nav>
-      </aside>
+            )}
+          </button>
+        )}
+
+        {user && (
+          <button
+            type="button"
+            onClick={() => {
+              hideSidebarTooltip();
+              handleLogout();
+            }}
+            onMouseEnter={(event) => showSidebarTooltip("Sign out", event)}
+            onMouseLeave={hideSidebarTooltip}
+            onFocus={(event) => showSidebarTooltip("Sign out", event)}
+            onBlur={hideSidebarTooltip}
+            aria-label="Sign out"
+            className={`flex items-center gap-3 rounded-xl text-blue-100 transition-all hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 ${
+              showLabels ? "mt-1.5 w-full px-3 py-2.5" : "mx-auto mt-1.5 h-11 w-11 justify-center"
+            }`}
+          >
+            <LogOut className="w-5 h-5 shrink-0" />
+            {showLabels && <span className="text-sm font-semibold leading-none">Sign out</span>}
+          </button>
+        )}
+      </div>
+
+      {/* Sidebar tooltip (nav icons when collapsed + collapse/expand header hint) */}
+      {!isMobile && sidebarTooltip && (
+        <div
+          className="fixed z-[9999] px-3 py-1.5 bg-[#1c1f26] text-white text-xs font-medium rounded-lg shadow-xl whitespace-nowrap border border-white/10 pointer-events-none"
+          style={{ left: sidebarTooltip.x, top: sidebarTooltip.y, transform: "translateY(-50%)" }}
+        >
+          {sidebarTooltip.label}
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <div
+      className={`min-h-screen bg-[#f6f7f9] flex font-poppins ${
+        isMobile ? "overflow-x-clip" : "overflow-hidden"
+      }`}
+    >
+      {/* Non-blocking indicator while the backend stores hydrate, so a slow
+          connection reads as "still loading" instead of "no data". */}
+      <TopProgressBar />
+
+      {/* Keyboard users can jump past the ~9-item sidebar on every page. */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[100] focus:rounded-lg focus:bg-white focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-[#1668D9] focus:shadow-lg focus:ring-2 focus:ring-[#1668D9]"
+      >
+        Skip to main content
+      </a>
+
+      {!isMobile && (
+        <aside
+          aria-label="Primary navigation"
+          className={`h-screen overflow-y-auto custom-scrollbar bg-[#1668D9] flex flex-col z-30 shadow-2xl transition-all duration-300 ease-in-out flex-shrink-0 relative ${
+            isNavigationOpen ? (isSidebarExpanded ? "w-64" : "w-[72px]") : "w-0"
+          }`}
+        >
+          {navigation}
+        </aside>
+      )}
 
       {/* ─── MAIN CONTENT ─── */}
-      <div className="flex-1 flex flex-col min-w-0 h-screen">
-        <header className="h-16 bg-white border-b border-gray-200 px-6 lg:px-8 flex items-center justify-between z-40 flex-shrink-0 shadow-sm">
-          <div className="flex items-center gap-3">
-            {showBackButton && (
+      <div
+        className={`flex-1 flex flex-col min-w-0 ${
+          isMobile ? "" : "h-screen"
+        }`}
+      >
+        <header
+          className={`min-h-16 bg-white border-b border-slate-200/80 px-4 sm:px-5 lg:px-6 py-2 flex items-center justify-between z-40 ${
+            isMobile ? "sticky top-0" : "flex-shrink-0"
+          }`}
+        >
+          <div className="flex items-center gap-3 min-w-0 flex-1">
+            {isMobile ? (
               <button
-                onClick={handleBack}
-                className="p-2 hover:bg-gray-100 rounded-lg transition-colors text-gray-500 hover:text-[#1D73EC]"
+                type="button"
+                onClick={() => setMobileNavOpen(!isMobileNavOpen)}
+                aria-label={isMobileNavOpen ? "Close navigation" : "Open navigation"}
+                aria-expanded={isMobileNavOpen}
+                className="rounded-xl p-2 text-[#1668D9] transition-all duration-200 hover:bg-[#F2F7FF] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9] focus-visible:ring-offset-2 shrink-0"
               >
-                <ArrowLeft className="w-5 h-5" />
+                <Menu className={`h-6 w-6 transition-transform duration-200 ${isMobileNavOpen ? "rotate-90" : "rotate-0"}`} />
+              </button>
+            ) : null}
+            {isMobile && !hideMobileBackButton && (showBackButton || !location.pathname.endsWith("/dashboard")) && (
+              <button
+                type="button"
+                onClick={() => backButtonPath ? navigate(backButtonPath) : navigate(-1)}
+                aria-label="Go back"
+                className="rounded-xl p-2 text-gray-600 hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9] shrink-0"
+              >
+                <ArrowLeft className="h-5 w-5" />
               </button>
             )}
-            <h1 className="text-base font-bold text-[#1c1f26] truncate">
+            <h1 className="text-base font-bold text-[#1c1f26] truncate min-w-0">
               {displayTitle}
             </h1>
           </div>
 
-          <div className="flex items-center gap-3">
-            {/* Role Badge */}
-            <div className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-bold uppercase tracking-wider ${
-              user?.role === 'admin' ? 'bg-purple-100 text-purple-700 border border-purple-200' :
-              user?.role === 'staff' ? 'bg-blue-100 text-blue-700 border border-blue-200' :
-              'bg-green-100 text-green-700 border border-green-200'
-            }`}>
-              <div className={`w-2 h-2 rounded-full ${
-                user?.role === 'admin' ? 'bg-purple-500' :
-                user?.role === 'staff' ? 'bg-blue-500' :
-                'bg-green-500'
-              }`} />
-              {user?.role === 'admin' ? 'Admin Account' : user?.role === 'staff' ? 'Staff Account' : 'Customer Account'}
+          {headerSearch && (
+            <div className="hidden md:flex items-center flex-1 max-w-md mx-6">
+              {headerSearch}
             </div>
+          )}
 
-            {/* SIEM Security Alerts (Admin Only) */}
-            {user?.role === 'admin' && (
-              <div className="relative">
-                <button
-                  onClick={() => {
-                    setIsSIEMOpen(!isSIEMOpen);
-                    setIsNotificationOpen(false);
-                    setIsProfileOpen(false);
-                  }}
-                  className={`p-2 rounded-xl border transition-all relative ${isSIEMOpen ? "bg-red-100 border-red-300" : siemCriticalCount > 0 ? "bg-red-50 border-red-200 animate-pulse" : "hover:bg-gray-50 border-transparent"}`}
-                >
-                  <Shield className={`w-5 h-5 ${siemCriticalCount > 0 ? 'text-red-600' : 'text-gray-600'}`} />
-                  {siemUnreadCount > 0 && (
-                    <span className="absolute -top-1 -right-1 min-w-5 h-5 bg-red-600 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1 ring-2 ring-white">
-                      {siemUnreadCount > 99 ? '99+' : siemUnreadCount}
-                    </span>
-                  )}
-                </button>
-
-                {isSIEMOpen && (
-                  <>
-                    <div
-                      className="fixed inset-0 z-10"
-                      onClick={() => setIsSIEMOpen(false)}
-                    />
-                    <div className="absolute right-0 mt-2 w-96 bg-white rounded-2xl shadow-2xl border border-red-200 z-20">
-                      <div className="px-4 py-3 border-b border-red-100 bg-red-50">
-                        <div className="flex items-center gap-2">
-                          <Shield className="w-4 h-4 text-red-600" />
-                          <h3 className="font-bold text-sm text-red-900">Security Alerts</h3>
-                          {siemCriticalCount > 0 && (
-                            <span className="ml-auto px-2 py-0.5 bg-red-600 text-white text-xs font-bold rounded-full">
-                              {siemCriticalCount} Critical
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="max-h-96 overflow-y-auto">
-                        {siemAlerts.length === 0 ? (
-                          <div className="p-8 text-center">
-                            <Shield className="w-8 h-8 text-gray-300 mx-auto mb-2" />
-                            <p className="text-xs text-gray-500">No security alerts</p>
-                          </div>
-                        ) : (
-                          siemAlerts.map((alert, index) => {
-                            const { icon: Icon, color } = getSIEMAlertIcon(alert.type);
-                            const severityClass = getSIEMSeverityBadge(alert.severity);
-                            return (
-                              <div
-                                key={alert.id}
-                                className={`p-4 ${index !== siemAlerts.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-red-50 transition-colors cursor-pointer ${!alert.read ? 'bg-red-50/50' : ''}`}
-                                onClick={() => handleSIEMAlertClick(alert)}
-                              >
-                                <div className="flex gap-3">
-                                  <div className={`w-8 h-8 ${color} rounded-lg flex items-center justify-center flex-shrink-0`}>
-                                    <Icon className="w-4 h-4" />
-                                  </div>
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-start justify-between gap-2 mb-1">
-                                      <p className={`text-xs ${!alert.read ? 'font-bold' : 'font-medium'} text-gray-900`}>
-                                        {alert.title}
-                                      </p>
-                                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${severityClass} uppercase`}>
-                                        {alert.severity}
-                                      </span>
-                                    </div>
-                                    <p className="text-xs text-gray-600 mb-1 line-clamp-2">
-                                      {alert.description}
-                                    </p>
-                                    {alert.affectedAccount && (
-                                      <p className="text-xs text-red-700 font-medium mb-1">
-                                        Account: {alert.affectedAccount}
-                                      </p>
-                                    )}
-                                    <p className="text-[10px] text-gray-400">
-                                      {formatTimeAgo(alert.timestamp)}
-                                    </p>
-                                  </div>
-                                  {!alert.read && (
-                                    <div className="w-2 h-2 bg-red-500 rounded-full flex-shrink-0 mt-1" />
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-                      <div className="px-4 py-2.5 border-t border-red-100 bg-red-50">
-                        <button
-                          className="text-xs font-medium text-red-700 hover:text-red-800 transition-colors"
-                          onClick={handleMarkAllSIEMRead}
-                        >
-                          Mark all as read
-                        </button>
-                      </div>
-                    </div>
-                  </>
-                )}
-              </div>
+          <div className="flex items-center gap-3 flex-shrink-0">
+            {/* Unclaimed-order indicator (customers only) */}
+            {user?.role === "customer" && (
+              <UnclaimedHeaderIndicator customerKey={user?.email} />
             )}
 
             {/* Notification Bell */}
             <div className="relative">
               <button
+                type="button"
                 onClick={() => {
                   setIsNotificationOpen(!isNotificationOpen);
-                  setIsProfileOpen(false);
-                  setIsSIEMOpen(false);
                 }}
-                className={`p-2 rounded-xl border transition-all relative ${isNotificationOpen ? "bg-gray-100 border-gray-300" : "hover:bg-gray-50 border-transparent"}`}
+                aria-label={`Notifications${combinedUnread > 0 ? `, ${combinedUnread} unread` : ''}`}
+                aria-expanded={isNotificationOpen}
+                aria-haspopup="true"
+                className={`p-2.5 rounded-xl border transition-all relative ${isNotificationOpen ? "bg-gray-100 border-gray-300" : "hover:bg-gray-50 border-transparent"}`}
               >
-                <Bell className="w-5 h-5 text-gray-600" />
-                {unreadCount > 0 && (
+                <Bell className="w-[22px] h-[22px] text-gray-600" />
+                {combinedUnread > 0 && (
                   <span className="absolute -top-1 -right-1 min-w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center px-1">
-                    {unreadCount > 99 ? '99+' : unreadCount}
+                    {combinedUnread > 99 ? '99+' : combinedUnread}
                   </span>
                 )}
               </button>
 
-              {isNotificationOpen && (
+              {notificationPresence && (
                 <>
                   <div
-                    className="fixed inset-0 z-10"
+                    className={`fixed inset-0 z-10 ${notificationPresence.isClosing ? "animate-out fade-out-0 duration-200" : "animate-in fade-in-0 duration-200"}`}
                     onClick={() => {
                       setIsNotificationOpen(false);
-                      setIsSIEMOpen(false);
                     }}
                   />
-                  <div className="absolute right-0 mt-2 w-80 bg-white rounded-2xl shadow-2xl border border-gray-100 z-20">
-                    <div className="px-4 py-3 border-b border-gray-100">
-                      <h3 className="font-bold text-sm text-gray-900">Notifications</h3>
-                    </div>
-                    <div className="max-h-96 overflow-y-auto">
-                      {notifications.length === 0 ? (
-                        <div className="p-8 text-center">
-                          <Bell className="w-8 h-8 text-gray-300 mx-auto mb-2" />
-                          <p className="text-xs text-gray-500">No notifications</p>
-                        </div>
-                      ) : (
-                        notifications.map((notification, index) => {
-                          const { icon: Icon, color } = getNotificationIcon(notification.type);
-                          return (
-                            <div
-                              key={notification.id}
-                              className={`p-4 ${index !== notifications.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-gray-50 transition-colors ${notification.clickable ? 'cursor-pointer' : ''} ${!notification.read ? 'bg-blue-50/50' : ''}`}
-                              onClick={() => handleNotificationClick(notification)}
-                            >
-                              <div className="flex gap-3">
-                                <div className={`w-8 h-8 ${color} rounded-lg flex items-center justify-center flex-shrink-0`}>
-                                  <Icon className="w-4 h-4" />
-                                </div>
-                                <div className="flex-1 min-w-0">
-                                  <p className={`text-xs ${!notification.read ? 'font-bold' : 'font-medium'} text-gray-900`}>
-                                    {notification.title}
-                                  </p>
-                                  <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">
-                                    {notification.message}
-                                  </p>
-                                  <p className="text-[10px] text-gray-400 mt-1">
-                                    {formatTimeAgo(notification.timestamp)}
-                                  </p>
-                                </div>
-                                {!notification.read && (
-                                  <div className="w-2 h-2 bg-blue-500 rounded-full flex-shrink-0 mt-1" />
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })
+                  <div className={`absolute right-0 mt-2 w-[min(24rem,calc(100vw-1.5rem))] max-h-[min(32rem,calc(100vh-6rem))] flex flex-col bg-white rounded-2xl shadow-2xl border border-gray-100 z-20 ${notificationPresence.isClosing ? "animate-out fade-out-0 zoom-out-95 slide-out-to-top-2 duration-200 pointer-events-none" : "animate-in fade-in-0 zoom-in-95 slide-in-from-top-2 duration-200"}`}>
+                    <div className="px-5 py-3.5 border-b border-gray-100 flex items-center justify-between">
+                      <h3 className="font-bold text-base text-gray-900">Notifications</h3>
+                      {combinedUnread > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleMarkAllRead}
+                          className="text-xs font-semibold text-[#1668D9] hover:text-[#10316B] transition-colors"
+                        >
+                          Mark all as read
+                        </button>
                       )}
                     </div>
-                    <div className="px-4 py-2.5 border-t border-gray-100">
-                      <button className="text-xs font-medium text-[#1D73EC] hover:text-[#1557b8] transition-colors" onClick={handleMarkAllRead}>
-                        Mark all as read
+                    <div className="overflow-y-auto flex-1 min-h-0">
+                      {bellItems.length === 0 ? (
+                        <div className="p-10 text-center">
+                          <Bell className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+                          <p className="text-sm text-gray-500">No notifications yet</p>
+                        </div>
+                      ) : (
+                        bellItems.map((item, index) => (
+                          <div
+                            key={item.key}
+                            role={item.clickable ? "button" : undefined}
+                            tabIndex={item.clickable ? 0 : undefined}
+                            className={`px-5 py-4 ${index !== bellItems.length - 1 ? 'border-b border-gray-50' : ''} hover:bg-gray-50 transition-colors ${item.clickable ? 'cursor-pointer' : ''} ${!item.read ? 'bg-blue-50/50' : ''}`}
+                            onClick={item.onClick}
+                            onKeyDown={item.clickable ? (event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
+                                item.onClick();
+                              }
+                            } : undefined}
+                          >
+                            <div className="flex gap-4">
+                              <div className={`w-10 h-10 ${item.color} rounded-xl flex items-center justify-center flex-shrink-0`}>
+                                <item.icon className="w-5 h-5" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <p className={`text-sm ${!item.read ? 'font-bold' : 'font-medium'} text-gray-900`}>
+                                  {item.title}
+                                </p>
+                                <p className="text-sm text-gray-500 mt-1 line-clamp-2 leading-relaxed">
+                                  {item.message}
+                                </p>
+                                <p className="text-xs text-gray-500 mt-1.5">
+                                  {formatTimeAgo(item.timestamp)}
+                                </p>
+                              </div>
+                              {!item.read && (
+                                <div className={`w-2.5 h-2.5 ${item.unreadDot} rounded-full flex-shrink-0 mt-1.5`} />
+                              )}
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                    <div className="px-5 py-3.5 border-t border-gray-100">
+                      <button
+                        type="button"
+                        onClick={handleShowAllNotifications}
+                        className="w-full inline-flex items-center justify-center gap-2 h-11 rounded-xl text-sm font-semibold bg-[#1668D9] text-white hover:bg-[#10316B] transition-all"
+                      >
+                        <Bell className="w-4 h-4" /> Show All Notifications
                       </button>
                     </div>
                   </div>
@@ -565,76 +1172,77 @@ export default function Layout({
               )}
             </div>
 
-            {/* Profile Dropdown */}
-            <div className="relative">
-              <button
-                onClick={() => {
-                  setIsProfileOpen(!isProfileOpen);
-                  setIsNotificationOpen(false);
-                  setIsSIEMOpen(false);
-                }}
-                className={`flex items-center gap-2.5 py-1.5 pl-1.5 pr-3 rounded-xl border transition-all ${isProfileOpen ? "bg-gray-100 border-gray-300" : "hover:bg-gray-50 border-transparent"}`}
-              >
-                {/* Profile Badge remains Gradient-styled if specified, or solid blue */}
-                <div className="w-8 h-8 bg-[#1D73EC] rounded-lg flex items-center justify-center text-white font-bold text-xs uppercase flex-shrink-0">
-                  {user?.email?.[0]}
-                </div>
-                <div className="hidden md:block text-left">
-                  <p className="text-xs font-bold text-gray-900 leading-none">
-                    {user?.email?.split("@")[0]}
-                  </p>
-                  <p className="text-[10px] text-gray-400 capitalize leading-none mt-0.5">
-                    {user?.role}
-                  </p>
-                </div>
-                <ChevronDown
-                  className={`w-4 h-4 text-gray-400 transition-transform ${isProfileOpen ? "rotate-180" : ""}`}
-                />
-              </button>
+            {/* Announcement Details Modal — shared across all entry points */}
+            <AnnouncementDetailsModal
+              open={!!selectedDetail}
+              onOpenChange={(open) => { if (!open) setSelectedDetail(null); }}
+              announcement={selectedDetail ? {
+                title: selectedDetail.title,
+                message: selectedDetail.message,
+                timestamp: selectedDetail.timestamp,
+                priority: selectedDetail.priority,
+                typeLabel: selectedDetail.typeLabel,
+                priorityLabel: selectedDetail.priorityLabel,
+                action: selectedDetail.action,
+              } : null}
+            />
 
-              {isProfileOpen && (
-                <>
-                  <div
-                    className="fixed inset-0 z-10"
-                    onClick={() => setIsProfileOpen(false)}
-                  />
-                  <div className="absolute right-0 mt-2 w-56 bg-white rounded-2xl shadow-2xl border border-gray-100 py-1.5 z-20">
-                    {/* Profile Section */}
+            {!isMobile && (
+              <div className="relative" ref={topProfileRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsTopProfileOpen(!isTopProfileOpen);
+                    setIsNotificationOpen(false);
+                  }}
+                  aria-label="Open profile"
+                  aria-expanded={isTopProfileOpen}
+                  aria-haspopup="menu"
+                  className="rounded-full transition-all duration-200 hover:scale-105 hover:ring-2 hover:ring-[#1668D9]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9] focus-visible:ring-offset-2"
+                >
+                  <div className="h-10 w-10 overflow-hidden rounded-full bg-[#1668D9] text-white shadow-sm flex items-center justify-center font-bold text-xs">
+                    {profileImage ? <img src={profileImage} alt="Profile" className="h-full w-full object-cover" /> : profileInitial}
+                  </div>
+                </button>
+                {topProfilePresence && (
+                  <div className={`absolute right-0 top-full z-50 mt-2 w-52 rounded-xl border border-gray-100 bg-white py-1.5 shadow-2xl ${topProfilePresence.isClosing ? "animate-out fade-out-0 zoom-out-95 slide-out-to-top-2 duration-200 pointer-events-none" : "animate-in fade-in-0 zoom-in-95 slide-in-from-top-2 duration-200"}`}>
                     <div className="px-4 py-3 border-b border-gray-100">
-                      <p className="text-xs font-bold text-gray-900">{user?.email}</p>
+                      <p className="text-xs font-bold text-gray-900 truncate">{user?.name || user?.email?.split("@")[0]}</p>
+                      <p className="text-[10px] text-gray-500 truncate mt-0.5">{user?.email}</p>
                       <p className="text-[10px] text-gray-500 capitalize mt-0.5">{user?.role} Account</p>
                     </div>
-
-                    <div className="py-1">
-                      <button
-                        onClick={() => {
-                          setIsProfileOpen(false);
-                          navigate(`/${user?.role}/profile`);
-                        }}
-                        className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition-colors font-medium"
-                      >
-                        <User className="w-4 h-4" /> My Profile
-                      </button>
-                    </div>
-
-                    <div className="border-t border-gray-100 py-1">
-                      <button
-                        onClick={handleLogout}
-                        className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-red-400 hover:bg-red-50 transition-colors font-medium"
-                      >
-                        <LogOut className="w-4 h-4" /> Sign Out
-                      </button>
-                    </div>
+                    <button type="button" onClick={() => { setIsTopProfileOpen(false); navigate("/"); }} className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm font-medium text-gray-700 hover:bg-gray-50">
+                      <Home className="h-4 w-4" /> Home
+                    </button>
+                    <button type="button" onClick={() => { setIsTopProfileOpen(false); navigate(`/${user?.role}/profile`); }} className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm font-medium text-gray-700 hover:bg-gray-50">
+                      <User className="h-4 w-4" /> Profile Settings
+                    </button>
+                    <button type="button" onClick={handleLogout} className="flex w-full items-center gap-3 border-t border-gray-100 px-4 py-2.5 text-left text-sm font-medium text-red-600 hover:bg-red-50">
+                      <LogOut className="h-4 w-4" /> Sign Out
+                    </button>
                   </div>
-                </>
-              )}
-            </div>
+                )}
+              </div>
+            )}
+
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto custom-scrollbar bg-[#f0f4f8]">
-          <div className="p-6 lg:p-8 max-w-[1440px] mx-auto">
-            {children}
+        <main
+          id="main-content"
+          ref={mainRef}
+          tabIndex={-1}
+          className={`bg-[#f6f7f9] outline-none ${
+            isMobile ? "" : "flex-1 overflow-y-auto custom-scrollbar"
+          }`}
+        >
+          <div className="p-4 sm:p-5 lg:p-6 max-w-[1440px] mx-auto w-full @container">
+            <div
+              key={location.pathname}
+              className="animate-in fade-in slide-in-from-right-2 duration-200"
+            >
+              {children}
+            </div>
           </div>
         </main>
       </div>
@@ -674,32 +1282,23 @@ export default function Layout({
           background: rgba(0,0,0,0.3);
           background-clip: padding-box;
         }
-
-        /* Sidebar-specific scrollbar - White theme for blue background */
-        aside .custom-scrollbar {
-          scrollbar-color: rgba(255,255,255,0.25) transparent;
-        }
-
-        aside .custom-scrollbar::-webkit-scrollbar-track {
-          background: rgba(255,255,255,0.05);
-        }
-
-        aside .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255,255,255,0.25);
-          border: 2px solid transparent;
-          background-clip: padding-box;
-        }
-
-        aside .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: rgba(255,255,255,0.35);
-          background-clip: padding-box;
-        }
-
-        aside .custom-scrollbar::-webkit-scrollbar-thumb:active {
-          background: rgba(255,255,255,0.45);
-          background-clip: padding-box;
-        }
       `}</style>
+
+      <HelpSupportDialog open={isHelpOpen} onOpenChange={setIsHelpOpen} onNavigate={navigate} />
+
+      {/* Sign Out Confirmation */}
+      {showLogoutConfirm && (
+        <ConfirmationDialog
+          open
+          onOpenChange={setShowLogoutConfirm}
+          onConfirm={confirmLogout}
+          title="Sign out of Docufy?"
+          description="You will be returned to the sign-in page. Your current session and app data will be preserved, but sign-in will be required to continue."
+          confirmLabel="Sign Out"
+          cancelLabel="Stay Signed In"
+          destructive={false}
+        />
+      )}
     </div>
   );
 }

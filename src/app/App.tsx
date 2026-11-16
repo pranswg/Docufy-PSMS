@@ -1,36 +1,64 @@
+import { lazy, Suspense } from 'react';
 import { createBrowserRouter, RouterProvider, Navigate } from 'react-router';
+import { Toaster } from './components/ui/sonner';
 import { AuthProvider } from './contexts/AuthContext';
-import LandingPage from './components/LandingPage';
-import LoginPage from './components/LoginPage';
-import SignUpPage from './components/SignUpPage';
-import CustomerDashboard from './components/customer/CustomerDashboard';
-import CustomerProfile from './components/customer/CustomerProfile';
-import NewPrintRequest from './components/customer/NewPrintRequest';
-import CustomerOrders from './components/customer/CustomerOrders';
-import CustomerPaymentVerification from './components/customer/PaymentVerification';
-import StaffQueueBoard from './components/staff/StaffQueueBoard';
-import StaffOrdersUnified from './components/staff/StaffOrdersUnified';
-import WalkInTransactions from './components/staff/WalkInTransactions';
-import StaffDashboard from './components/staff/StaffDashboard';
-import StaffPaymentVerificationUnified from './components/staff/StaffPaymentVerificationUnified';
-import InventoryManagement from './components/staff/InventoryManagement';
-import AdminDashboard from './components/admin/AdminDashboard';
-import AdminPaymentVerificationUnified from './components/admin/AdminPaymentVerificationUnified';
-import SecurityCenter from './components/admin/SecurityCenter';
-import AuditLogs from './components/admin/AuditLogs';
-import BackupManagement from './components/admin/BackupManagement';
-import AdminOrders from './components/admin/AdminOrders';
-import AdminOrdersUnified from './components/admin/AdminOrdersUnified';
-import Inventory from './components/admin/Inventory';
-import Staff from './components/admin/Staff';
-import JobBoardManagement from './components/admin/JobBoardManagement';
-import AdminWalkInTransactions from './components/admin/WalkInTransactions';
-import Reports from './components/admin/Reports';
-import ContentManagement from './components/admin/ContentManagement';
-import OrderTracking from './components/customer/OrderTracking';
-import JobBoard from './components/customer/JobBoard';
-import JobApplyForm from './components/customer/JobApplyForm';
 import ProtectedRoute from './components/ProtectedRoute';
+import { MobileNavProvider } from './contexts/MobileNavContext';
+import { PopupProvider } from './contexts/PopupContext';
+import MobileNavSheet from './components/shared/MobileNavSheet';
+// Module-level side effect: subscribes to the inventory store and emits Low
+// Stock / Out of Stock alerts to the Notifications system on any inventory
+// change (Stock In/Out, order deductions, item edits).
+import './utils/inventoryAlerts';
+// Auto-cancels awaited-payment orders whose payment deadline has passed.
+import './utils/paymentExpiry';
+// Seeds the single-row settings tables + pricing matrix cells (best-effort).
+import '../lib/db/bootstrap';
+
+const LandingPage = lazy(() => import('./components/LandingPage'));
+const LoginPage = lazy(() => import('./components/LoginPage'));
+const SignUpPage = lazy(() => import('./components/SignUpPage'));
+const AuthCallbackPage = lazy(() => import('./components/AuthCallbackPage'));
+const ForgotPassword = lazy(() => import('./components/ForgotPassword'));
+const ResetPasswordPage = lazy(() => import('./components/ResetPasswordPage'));
+const CustomerDashboard = lazy(() => import('./components/customer/CustomerDashboard'));
+const CustomerProfile = lazy(() => import('./components/customer/CustomerProfile'));
+const NewPrintRequest = lazy(() => import('./components/customer/NewPrintRequest'));
+const CustomerOrders = lazy(() => import('./components/customer/CustomerOrders'));
+const CustomerPaymentVerification = lazy(() => import('./components/customer/PaymentVerification'));
+const DownPaymentMethod = lazy(() => import('./components/customer/DownPaymentMethod'));
+const StaffOrdersUnified = lazy(() => import('./components/staff/StaffOrdersUnified'));
+const StaffPickupMonitoring = lazy(() => import('./components/staff/StaffPickupMonitoring'));
+const StaffUnclaimedOrders = lazy(() => import('./components/staff/StaffUnclaimedOrders'));
+const StaffUnclaimedOrderHistory = lazy(() => import('./components/staff/StaffUnclaimedOrderHistory'));
+const StaffUnclaimedRestrictions = lazy(() => import('./components/staff/StaffUnclaimedRestrictions'));
+const WalkInTransactions = lazy(() => import('./components/staff/WalkInTransactions'));
+const StaffDashboard = lazy(() => import('./components/staff/StaffDashboard'));
+const StaffProfile = lazy(() => import('./components/staff/StaffProfile'));
+const StaffTimesheet = lazy(() => import('./components/staff/StaffTimesheet'));
+const StaffPaymentVerificationUnified = lazy(() => import('./components/staff/StaffPaymentVerificationUnified'));
+const AdminDashboard = lazy(() => import('./components/admin/AdminDashboard'));
+const AdminProfile = lazy(() => import('./components/admin/AdminProfile'));
+const AdminPaymentVerificationUnified = lazy(() => import('./components/admin/AdminPaymentVerificationUnified'));
+const AdminOrdersUnified = lazy(() => import('./components/admin/AdminOrdersUnified'));
+const AdminPickupMonitoring = lazy(() => import('./components/admin/AdminPickupMonitoring'));
+const AdminUnclaimedOrders = lazy(() => import('./components/admin/AdminUnclaimedOrders'));
+const AdminUnclaimedOrderHistory = lazy(() => import('./components/admin/AdminUnclaimedOrderHistory'));
+const AdminUnclaimedRestrictions = lazy(() => import('./components/admin/AdminUnclaimedRestrictions'));
+const Staff = lazy(() => import('./components/admin/Staff'));
+const InventoryManagement = lazy(() => import('./components/admin/InventoryManagement'));
+const PaymentMethodsManagement = lazy(() => import('./components/admin/PaymentMethodsManagement'));
+const PricingManagement = lazy(() => import('./components/admin/PricingManagement'));
+const LandingPageEditor = lazy(() => import('./components/admin/LandingPageEditor'));
+const LegalManagement = lazy(() => import('./components/admin/LegalManagement'));
+const AuditLogManagement = lazy(() => import('./components/admin/AuditLogManagement'));
+const JobBoardManagement = lazy(() => import('./components/admin/JobBoardManagement'));
+const AdminWalkInTransactions = lazy(() => import('./components/admin/WalkInTransactions'));
+const OrderTracking = lazy(() => import('./components/customer/OrderTracking'));
+const JobBoard = lazy(() => import('./components/customer/JobBoard'));
+const JobApplyForm = lazy(() => import('./components/customer/JobApplyForm'));
+const NotificationsPage = lazy(() => import('./components/shared/NotificationsPage'));
+const StaffInventory = lazy(() => import('./components/staff/StaffInventory'));
 
 // Simple error boundary component
 function ErrorBoundary() {
@@ -40,6 +68,18 @@ function ErrorBoundary() {
       <p>Please try refreshing the page or contact support.</p>
       <button onClick={() => window.location.href = '/login'}>Go to Login</button>
     </div>
+  );
+}
+
+function PageLoading() {
+  return (
+    <main
+      role="status"
+      aria-live="polite"
+      className="flex min-h-screen items-center justify-center bg-[#f6f7f9] px-4 text-sm font-medium text-slate-600"
+    >
+      Loading page…
+    </main>
   );
 }
 
@@ -57,6 +97,21 @@ const router = createBrowserRouter([
   {
     path: '/signup',
     element: <SignUpPage />,
+    errorElement: <ErrorBoundary />,
+  },
+  {
+    path: '/auth/callback',
+    element: <AuthCallbackPage />,
+    errorElement: <ErrorBoundary />,
+  },
+  {
+    path: '/forgot-password',
+    element: <ForgotPassword />,
+    errorElement: <ErrorBoundary />,
+  },
+  {
+    path: '/reset-password',
+    element: <ResetPasswordPage />,
     errorElement: <ErrorBoundary />,
   },
   {
@@ -103,6 +158,14 @@ const router = createBrowserRouter([
         path: 'payment/:orderId',
         element: <ProtectedRoute role="customer"><CustomerPaymentVerification /></ProtectedRoute>,
       },
+      {
+        path: 'payment-method/:orderId',
+        element: <ProtectedRoute role="customer"><DownPaymentMethod /></ProtectedRoute>,
+      },
+      {
+        path: 'notifications',
+        element: <ProtectedRoute role="customer"><NotificationsPage /></ProtectedRoute>,
+      },
     ],
   },
   {
@@ -118,8 +181,32 @@ const router = createBrowserRouter([
         element: <ProtectedRoute role="staff"><StaffDashboard /></ProtectedRoute>,
       },
       {
+        path: 'profile',
+        element: <ProtectedRoute role="staff"><StaffProfile /></ProtectedRoute>,
+      },
+      {
+        path: 'timesheet',
+        element: <ProtectedRoute role="staff"><StaffTimesheet /></ProtectedRoute>,
+      },
+      {
         path: 'queue',
         element: <ProtectedRoute role="staff"><StaffOrdersUnified /></ProtectedRoute>,
+      },
+      {
+        path: 'queue/pickup',
+        element: <ProtectedRoute role="staff"><StaffPickupMonitoring /></ProtectedRoute>,
+      },
+      {
+        path: 'queue/unclaimed',
+        element: <ProtectedRoute role="staff"><StaffUnclaimedOrders /></ProtectedRoute>,
+      },
+      {
+        path: 'queue/unclaimed/history',
+        element: <ProtectedRoute role="staff"><StaffUnclaimedOrderHistory /></ProtectedRoute>,
+      },
+      {
+        path: 'queue/unclaimed/restrictions',
+        element: <ProtectedRoute role="staff"><StaffUnclaimedRestrictions /></ProtectedRoute>,
       },
       {
         path: 'orders',
@@ -135,7 +222,11 @@ const router = createBrowserRouter([
       },
       {
         path: 'inventory',
-        element: <ProtectedRoute role="staff"><InventoryManagement /></ProtectedRoute>,
+        element: <ProtectedRoute role="staff"><StaffInventory /></ProtectedRoute>,
+      },
+      {
+        path: 'notifications',
+        element: <ProtectedRoute role="staff"><NotificationsPage /></ProtectedRoute>,
       },
     ],
   },
@@ -152,6 +243,10 @@ const router = createBrowserRouter([
         element: <ProtectedRoute role="admin"><AdminDashboard /></ProtectedRoute>,
       },
       {
+        path: 'profile',
+        element: <ProtectedRoute role="admin"><AdminProfile /></ProtectedRoute>,
+      },
+      {
         path: 'walk-in',
         element: <ProtectedRoute role="admin"><AdminWalkInTransactions /></ProtectedRoute>,
       },
@@ -160,16 +255,59 @@ const router = createBrowserRouter([
         element: <ProtectedRoute role="admin"><AdminPaymentVerificationUnified /></ProtectedRoute>,
       },
       {
+        path: 'payment-methods',
+        element: <ProtectedRoute role="admin"><PaymentMethodsManagement /></ProtectedRoute>,
+      },
+      {
+        path: 'pricing',
+        element: <ProtectedRoute role="admin"><PricingManagement /></ProtectedRoute>,
+      },
+      {
+        path: 'landing',
+        element: <ProtectedRoute role="admin"><LandingPageEditor /></ProtectedRoute>,
+      },
+      {
+        path: 'legal',
+        element: <ProtectedRoute role="admin"><LegalManagement /></ProtectedRoute>,
+      },
+      {
+        path: 'audit-trail',
+        element: <ProtectedRoute role="admin"><AuditLogManagement /></ProtectedRoute>,
+      },
+      {
         path: 'orders',
         element: <ProtectedRoute role="admin"><AdminOrdersUnified /></ProtectedRoute>,
       },
       {
+        path: 'orders/pickup',
+        element: <ProtectedRoute role="admin"><AdminPickupMonitoring /></ProtectedRoute>,
+      },
+      {
+        path: 'orders/unclaimed',
+        element: <ProtectedRoute role="admin"><AdminUnclaimedOrders /></ProtectedRoute>,
+      },
+      {
+        path: 'orders/unclaimed/history',
+        element: <ProtectedRoute role="admin"><AdminUnclaimedOrderHistory /></ProtectedRoute>,
+      },
+      {
+        path: 'orders/unclaimed/restrictions',
+        element: <ProtectedRoute role="admin"><AdminUnclaimedRestrictions /></ProtectedRoute>,
+      },
+      {
         path: 'inventory',
-        element: <ProtectedRoute role="admin"><Inventory /></ProtectedRoute>,
+        element: <ProtectedRoute role="admin"><InventoryManagement /></ProtectedRoute>,
       },
       {
         path: 'staff',
         element: <ProtectedRoute role="admin"><Staff /></ProtectedRoute>,
+      },
+      {
+        // Attendance is no longer a page of its own; the old route is kept
+        // alive for bookmarks but says where it went instead of silently
+        // swapping the screen (F28).
+        path: 'attendance',
+        element: <Navigate to="/admin/staff" replace />,
       },
       {
         path: 'jobs',
@@ -180,24 +318,8 @@ const router = createBrowserRouter([
         element: <ProtectedRoute role="admin"><JobBoardManagement /></ProtectedRoute>,
       },
       {
-        path: 'reports',
-        element: <ProtectedRoute role="admin"><Reports /></ProtectedRoute>,
-      },
-      {
-        path: 'content',
-        element: <ProtectedRoute role="admin"><ContentManagement /></ProtectedRoute>,
-      },
-      {
-        path: 'security-center',
-        element: <ProtectedRoute role="admin"><SecurityCenter /></ProtectedRoute>,
-      },
-      {
-        path: 'audit-logs',
-        element: <ProtectedRoute role="admin"><AuditLogs /></ProtectedRoute>,
-      },
-      {
-        path: 'backup-management',
-        element: <ProtectedRoute role="admin"><BackupManagement /></ProtectedRoute>,
+        path: 'notifications',
+        element: <ProtectedRoute role="admin"><NotificationsPage /></ProtectedRoute>,
       },
     ],
   },
@@ -205,8 +327,16 @@ const router = createBrowserRouter([
 
 export default function App() {
   return (
-    <AuthProvider>
-      <RouterProvider router={router} />
-    </AuthProvider>
+    <PopupProvider>
+      <AuthProvider>
+        <MobileNavProvider>
+          <Suspense fallback={<PageLoading />}>
+            <RouterProvider router={router} />
+          </Suspense>
+          <MobileNavSheet router={router} />
+          <Toaster richColors position="top-center" />
+        </MobileNavProvider>
+      </AuthProvider>
+    </PopupProvider>
   );
 }

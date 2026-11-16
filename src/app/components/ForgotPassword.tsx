@@ -1,64 +1,55 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router';
-import { ArrowLeft, Mail, Key, Lock } from 'lucide-react';
-import { toast } from 'sonner';
+import { ArrowLeft, Mail, MailCheck, RefreshCw } from 'lucide-react';
+import { usePopup } from '../contexts/PopupContext';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { useAuth } from '../contexts/AuthContext';
-import { PasswordStrengthIndicator, validatePassword } from './ui/password-strength-indicator';
-import logoImage from 'figma:asset/32cd46dac3d06839e0db69b6c6ad22c9a8ac17a6.png';
+import { useLogo } from '../hooks/useLogo';
+import { usePageTitle } from '../hooks/usePageTitle';
 
+// Password recovery is link-based: Supabase emails a one-time link that opens
+// /reset-password on THIS deployment, where the new password is set. The old
+// "we emailed you a 6-digit code" copy belonged to the retired mock flow and
+// never matched what the backend actually sends.
 export default function ForgotPassword() {
+  usePageTitle('Reset password');
   const navigate = useNavigate();
-  const { sendPasswordResetCode, verifyResetCode, resetPassword } = useAuth();
-  const [step, setStep] = useState<'email' | 'code' | 'password'>('email');
+  const logo = useLogo();
+  const { showPopup } = usePopup();
+  const { requestPasswordReset } = useAuth();
   const [email, setEmail] = useState('');
-  const [resetCode, setResetCode] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
-  const [currentPassword, setCurrentPassword] = useState('');
+  const [sentTo, setSentTo] = useState('');
+  const [sending, setSending] = useState(false);
 
-  const handleSendCode = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (sendPasswordResetCode(email)) {
-      setStep('code');
+  const sendLink = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const target = email.trim();
+    if (!target) return;
+
+    setSending(true);
+    const result = await requestPasswordReset(target);
+    setSending(false);
+
+    if (result.success) {
+      setSentTo(target);
+      showPopup('Password reset link sent. Check your inbox.', 'success');
     } else {
-      toast.error('Email not found');
+      showPopup(result.error || 'We could not send the reset link. Please try again.', 'error');
     }
   };
 
-  const handleVerifyCode = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (verifyResetCode(email, resetCode)) {
-      setStep('password');
-      toast.success('Code verified! Enter your new password.');
+  const handleResend = async () => {
+    setSending(true);
+    const result = await requestPasswordReset(sentTo);
+    setSending(false);
+
+    if (result.success) {
+      showPopup('A new reset link is on its way.', 'success');
     } else {
-      toast.error('Invalid code. Please try again.');
-    }
-  };
-
-  const handleResetPassword = (e: React.FormEvent) => {
-    e.preventDefault();
-
-    // Validate password strength
-    const passwordValidation = validatePassword(newPassword);
-    if (!passwordValidation.isValid) {
-      toast.error('Password does not meet security requirements');
-      return;
-    }
-
-    if (newPassword !== confirmPassword) {
-      toast.error('Passwords do not match');
-      return;
-    }
-
-    if (resetPassword(email, currentPassword, newPassword)) {
-      toast.success('Password reset successful! Please login.');
-      navigate('/login');
-    } else {
-      toast.error('Failed to reset password. Please check your current password.');
+      showPopup(result.error || 'We could not resend the reset link. Please try again.', 'error');
     }
   };
 
@@ -66,133 +57,88 @@ export default function ForgotPassword() {
     <div className="min-h-screen bg-[#F2F7FF] flex items-center justify-center p-4 font-poppins">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <img src={logoImage} alt="DocuFy Logo" className="w-16 h-16 mx-auto mb-4 rounded-full" />
+          <img src={logo} alt="Docufy Logo" className="w-16 h-16 mx-auto mb-4 rounded-full" />
           <h1 className="text-3xl font-bold text-[#1c1f26] mb-2">Reset Password</h1>
           <p className="text-gray-600">
-            {step === 'email' && "Enter your email to receive a reset code"}
-            {step === 'code' && "Enter the 6-digit code sent to your email"}
-            {step === 'password' && "Create your new password"}
+            {sentTo
+              ? 'We sent you a link to set a new password.'
+              : 'Enter your email and we will send you a link to set a new password.'}
           </p>
         </div>
 
         <Card className="p-8 bg-white shadow-lg">
-          {step === 'email' && (
-            <form onSubmit={handleSendCode} className="space-y-6">
+          {!sentTo ? (
+            <form onSubmit={sendLink} className="space-y-6">
               <div className="space-y-2">
                 <Label htmlFor="email">Email Address</Label>
                 <div className="relative">
-                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
                   <Input
                     id="email"
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
-                    placeholder="Enter your email"
+                    placeholder="name@psu.palawan.edu.ph"
                     className="pl-10"
                     required
+                    autoComplete="email"
                   />
                 </div>
-              </div>
-
-              <Button type="submit" className="w-full bg-[#2F6FD6] hover:bg-[#2557b8]">
-                Send Reset Code
-              </Button>
-            </form>
-          )}
-
-          {step === 'code' && (
-            <form onSubmit={handleVerifyCode} className="space-y-6">
-              <div className="space-y-2">
-                <Label htmlFor="code">Verification Code</Label>
-                <div className="relative">
-                  <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-                  <Input
-                    id="code"
-                    type="text"
-                    value={resetCode}
-                    onChange={(e) => setResetCode(e.target.value)}
-                    placeholder="Enter 6-digit code"
-                    maxLength={6}
-                    className="pl-10 text-center text-2xl tracking-widest"
-                    required
-                  />
-                </div>
-                <p className="text-xs text-gray-500">Check the browser console for the demo code</p>
-              </div>
-
-              <Button type="submit" className="w-full bg-[#2F6FD6] hover:bg-[#2557b8]">
-                Verify Code
-              </Button>
-            </form>
-          )}
-
-          {step === 'password' && (
-            <form onSubmit={handleResetPassword} className="space-y-6">
-              <div className="space-y-2">
-                <Label htmlFor="currentPassword">Current Password</Label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-                  <Input
-                    id="currentPassword"
-                    type="password"
-                    value={currentPassword}
-                    onChange={(e) => setCurrentPassword(e.target.value)}
-                    placeholder="Enter current password"
-                    className="pl-10"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="newPassword">New Password</Label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-                  <Input
-                    id="newPassword"
-                    type="password"
-                    value={newPassword}
-                    onChange={(e) => setNewPassword(e.target.value)}
-                    placeholder="Enter new password"
-                    className="pl-10"
-                    required
-                  />
-                </div>
-                {newPassword && (
-                  <div className="mt-2">
-                    <PasswordStrengthIndicator password={newPassword} />
-                  </div>
-                )}
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="confirmPassword">Confirm New Password</Label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-                  <Input
-                    id="confirmPassword"
-                    type="password"
-                    value={confirmPassword}
-                    onChange={(e) => setConfirmPassword(e.target.value)}
-                    placeholder="Confirm new password"
-                    className="pl-10"
-                    required
-                  />
-                </div>
+                <p className="text-xs text-gray-500">
+                  The link opens Docufy on this device, where you can choose a new password.
+                </p>
               </div>
 
               <Button
                 type="submit"
-                disabled={!validatePassword(newPassword).isValid}
-                className={`w-full ${
-                  validatePassword(newPassword).isValid
-                    ? "bg-[#2F6FD6] hover:bg-[#2557b8]"
-                    : "bg-gray-300 text-gray-500 cursor-not-allowed"
-                }`}
+                variant="primary"
+                loading={sending}
+                loadingText="Sending link..."
+                className="w-full"
               >
-                Reset Password
+                Send Reset Link
               </Button>
             </form>
+          ) : (
+            <div className="space-y-6">
+              <div className="flex flex-col items-center text-center space-y-3">
+                <div className="w-14 h-14 rounded-full bg-blue-50 text-[#2F6FD6] flex items-center justify-center">
+                  <MailCheck className="w-7 h-7" />
+                </div>
+                <div>
+                  <p className="font-semibold text-[#1c1f26]">Check your email</p>
+                  <p className="text-sm text-gray-600 mt-1">
+                    We sent a password reset link to <span className="font-medium text-gray-800">{sentTo}</span>.
+                    Open it on this device to choose a new password.
+                  </p>
+                </div>
+                <p className="text-xs text-gray-500">
+                  The link expires shortly. If it does not arrive, check your spam folder or request a new one.
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleResend}
+                  loading={sending}
+                  loadingText="Resending..."
+                  className="w-full"
+                >
+                  {!sending && <RefreshCw className="w-4 h-4" />}
+                  Resend Link
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setSentTo('')}
+                  className="w-full"
+                >
+                  Use a different email
+                </Button>
+              </div>
+            </div>
           )}
 
           <div className="mt-6">

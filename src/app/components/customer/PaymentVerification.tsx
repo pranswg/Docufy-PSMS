@@ -3,29 +3,40 @@ import {
   useNavigate,
   useParams,
   useLocation,
+  useBlocker,
 } from "react-router";
 import {
   LayoutDashboard,
   FileText,
   Upload,
   AlertCircle,
+  XCircle,
   Package,
   Briefcase,
   X,
   Image,
-  Eye,
   Smartphone,
   CheckCircle2,
-  ScanLine,
   Banknote,
+  Loader2,
+  ArrowLeft,
 } from "lucide-react";
 import { toast } from "sonner";
 import Layout from "../Layout";
 import { Card } from "../ui/card";
+import { DetailSkeleton } from "../ui/card-skeleton";
+import { useHydrating } from "../../utils/useHydrating";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
-import { Alert, AlertDescription } from "../ui/alert";
+import { FieldError, describedBy } from "../ui/field-error";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../ui/select";
 import {
   Dialog,
   DialogContent,
@@ -33,7 +44,133 @@ import {
   DialogTitle,
   DialogDescription,
 } from "../ui/dialog";
-import { dataStore } from "../../utils/dataStore";
+import { ConfirmationDialog } from "../ui/confirmation-dialog";
+import { dataStore, type Order as DataStoreOrder } from "../../utils/dataStore";
+import { notificationStore } from "../../utils/notificationStore";
+import { useAuth } from "../../contexts/AuthContext";
+import { showDbError } from "../../../lib/db/errors";
+import { submitPayment } from "../../../lib/db/paymentsRepo";
+import {
+  BUCKETS,
+  uploadObjectAndGetPath,
+} from "../../../lib/db/storage";
+import { formatCurrency } from "../../utils/formatNumber";
+import { formatPHDateTime } from "../../utils/pht";
+import { PaymentDeadlineCountdown } from "../shared/PaymentDeadlineCountdown";
+import {
+  clearPrintDraft,
+} from "../shared/PrintTransaction";
+import {
+  paymentMethodsStore,
+  type PaymentMethodType,
+} from "../../utils/paymentMethodsStore";
+import PaymentMethodQRPanel from "../shared/PaymentMethodQR";
+import { CashOnPickupAcknowledgement } from "../shared/CashOnPickupAcknowledgement";
+import Tesseract from "tesseract.js";
+
+let ocrWorkerPromise: Promise<Tesseract.Worker> | null = null;
+
+function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    ocrWorkerPromise = Tesseract.createWorker("eng");
+  }
+  return ocrWorkerPromise;
+}
+
+// Preprocess an uploaded image so OCR can read light-gray / low-contrast text.
+// Upscales, converts to grayscale, and boosts contrast / darkens so faint text
+// (e.g. GCash "Ref No." labels in light gray) becomes clearly readable black.
+async function preprocessImage(file: File): Promise<HTMLCanvasElement> {
+  let source: CanvasImageSource;
+  let width: number;
+  let height: number;
+  let cleanup = () => {};
+
+  if (typeof createImageBitmap === "function") {
+    const bitmap = await createImageBitmap(file);
+    source = bitmap;
+    width = bitmap.width;
+    height = bitmap.height;
+    cleanup = () => bitmap.close();
+  } else {
+    const objectUrl = URL.createObjectURL(file);
+    const image = new window.Image();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        image.onload = () => resolve();
+        image.onerror = () => reject(new Error("The selected image could not be decoded."));
+        image.src = objectUrl;
+      });
+    } catch (error) {
+      URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
+    source = image;
+    width = image.naturalWidth;
+    height = image.naturalHeight;
+    cleanup = () => URL.revokeObjectURL(objectUrl);
+  }
+
+  const scale = 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = width * scale;
+  canvas.height = height * scale;
+  try {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Image processing is unavailable in this browser.");
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imageData.data;
+    const contrast = 1.7;
+    const brightness = -35;
+    for (let i = 0; i < d.length; i += 4) {
+      const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const adjusted = (gray - 128) * contrast + 128 + brightness;
+      const v = Math.max(0, Math.min(255, adjusted));
+      d[i] = v;
+      d[i + 1] = v;
+      d[i + 2] = v;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    return canvas;
+  } finally {
+    cleanup();
+  }
+}
+
+// Extract a GCash-style reference number from the OCR text. Prefers the digits
+// shown after a "Ref No." / "Reference Number" label (spanning line breaks);
+// only falls back to a standalone digit run when no label is found, and even
+// then only for a plausible reference length so random numbers are ignored.
+function extractReferenceNumber(text: string): string {
+  const labelMatch = text.match(
+    /(?:Ref\.?\s*No\.?|Reference\s*Number)\s*[:.\-\s\n]*([0-9][0-9\s,.\-]*)/i,
+  );
+  if (labelMatch) {
+    const ref = labelMatch[1].replace(/[^\d]/g, "");
+    if (ref.length >= 6) return ref.slice(0, 20);
+  }
+
+  // Fallback: find standalone digit groups and prefer one near 13 digits
+  // (typical GCash reference) so phone numbers / random groups are avoided.
+  const candidates: string[] = [];
+  for (const m of text.matchAll(/(?:^|[^\d])(\d[\d\s,.\-]{5,19})(?:[^\d]|$)/g)) {
+    const digits = m[1].replace(/[^\d]/g, "");
+    if (digits.length >= 6 && digits.length <= 20) {
+      candidates.push(digits);
+    }
+  }
+  if (candidates.length) {
+    candidates.sort(
+      (a, b) =>
+        Math.abs(a.length - 13) - Math.abs(b.length - 13) ||
+        b.length - a.length,
+    );
+    return candidates[0].slice(0, 20);
+  }
+  return "";
+}
 
 const menuItems = [
   {
@@ -58,24 +195,39 @@ const menuItems = [
   },
 ];
 
-// Sample GCash QR Code (placeholder)
-const GCASH_QR_CODE =
-  "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMDAiIGhlaWdodD0iMjAwIiB2aWV3Qm94PSIwIDAgMjAwIDIwMCI+PHJlY3Qgd2lkdGg9IjIwMCIgaGVpZ2h0PSIyMDAiIGZpbGw9IndoaXRlIi8+PGcgZmlsbD0iYmxhY2siPjxyZWN0IHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgeD0iMjAiIHk9IjIwIi8+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiB4PSI0MCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjUwIiB5PSIyMCIvPjxyZWN0IHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgeD0iNjAiIHk9IjIwIi8+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiB4PSI4MCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjExMCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjE0MCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjE1MCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjE2MCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjE3MCIgeT0iMjAiLz48cmVjdCB3aWR0aD0iMTAiIGhlaWdodD0iMTAiIHg9IjIwIiB5PSIzMCIvPjxyZWN0IHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCIgeD0iODAiIHk9IjMwIi8+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiB4PSIxNDAiIHk9IjMwIi8+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiB4PSIxNzAiIHk9IjMwIi8+PC9nPjwvc3ZnPg==";
-
 export default function PaymentVerification() {
+  const hydrating = useHydrating();
   const navigate = useNavigate();
   const location = useLocation();
   const { orderId } = useParams();
+  const { user } = useAuth();
+  const goToNewRequest = () => {
+    clearPrintDraft();
+    navigate("/customer/new-request");
+  };
   const [paymentMethod, setPaymentMethod] = useState<
-    "gcash" | "cash"
-  >("gcash"); // Only GCash or Cash on Pickup
+    string
+  >(""); // method name or "cash"
+  const [onlineMethods, setOnlineMethods] = useState<
+    PaymentMethodType[]
+  >([]);
   const [
     showPaymentMethodSelector,
     setShowPaymentMethodSelector,
   ] = useState(false);
   const [referenceNumber, setReferenceNumber] = useState("");
+  const [detectedReference, setDetectedReference] = useState("");
+  const [amountPaid, setAmountPaid] = useState("");
+  // Down-payment orders: how much the customer pays now — Partial pays the 50%
+  // down payment, Full pays the whole total up front.
+  const [paymentChoice, setPaymentChoice] = useState<"partial" | "full">("partial");
   const [proofFile, setProofFile] = useState<File | null>(null);
   const [fileError, setFileError] = useState("");
+  // Inline validation: an invalid submit must leave a visible reason on the
+  // field itself, not only a toast that disappears.
+  const [referenceError, setReferenceError] = useState("");
+  const [proofError, setProofError] = useState("");
+
   const [showImagePreview, setShowImagePreview] =
     useState(false);
   const [imagePreviewUrl, setImagePreviewUrl] = useState<
@@ -83,42 +235,154 @@ export default function PaymentVerification() {
   >(null);
   const [isScanning, setIsScanning] = useState(false);
   const [showSuccessDialog, setShowSuccessDialog] = useState(false);
+  // Submitting the reference writes the order + proof + notifications, so the
+  // confirm dialog needs a real pending state instead of vanishing instantly.
+  const [submitting, setSubmitting] = useState(false);
+  const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [cashAcknowledged, setCashAcknowledged] = useState(false);
+  // Live view of the actual order (payment deadline, amounts, required payment).
+  const [order, setOrder] = useState<DataStoreOrder | null>(null);
 
-  // Load payment method from navigation state or localStorage
+  useEffect(() => {
+    if (!orderId) return;
+    const load = () => setOrder(dataStore.getOrderById(orderId!) || null);
+    load();
+    const unsubscribe = dataStore.subscribe(load);
+    return unsubscribe;
+  }, [orderId]);
+
+  // Order rows are now created in Supabase at checkout for every flow (this
+  // uuid is the real order id), so the loaded order is authoritative.
+  const displayOrder = order;
+
+  // Numeric order total. `displayOrder.total` is a formatted string ("₱1,250"),
+  // so it must be stripped to digits before any arithmetic — reading it directly
+  // produced "₱NaN" in the balance text.
+  const orderTotal =
+    parseFloat((displayOrder?.total || "0").replace(/[^0-9.]/g, "")) || 0;
+
+  const isOnline = paymentMethod !== "" && paymentMethod !== "cash";
+
+  // When the customer submitted the reference. Submitting clears the payment
+  // deadline, so the order page would otherwise stop showing any time at all —
+  // the latest entry in the payment timeline is the honest source.
+  const submittedAt = (() => {
+    const timeline = displayOrder?.paymentTimeline ?? [];
+    for (let i = timeline.length - 1; i >= 0; i -= 1) {
+      if (timeline[i].submittedAt) return timeline[i].submittedAt;
+    }
+    return undefined;
+  })();
+
+  // Guard against leaving the payment verification step so an accidental
+  // navigation doesn't discard the entered reference / proof. Released once the
+  // payment has been submitted (success dialog is up) and for already-canceled
+  // orders or an in-flight cancel confirmation, so the intentional
+  // post-submit / cancel navigation and the canceled page never prompt. Cash
+  // on Pickup has nothing to submit, so it is kept prompt-free.
+  const paymentBlocker = useBlocker(
+    isOnline &&
+      !showSuccessDialog &&
+      !showCancelConfirm &&
+      order?.status !== "Canceled" &&
+      !!displayOrder,
+  );
+
+  // Derive the amount the customer pays from the Partial/Full choice (50% down
+  // payment vs whole total) for down-payment orders, then keep amountPaid in
+  // sync so submit/verification use the right figure.
+  useEffect(() => {
+    if (!displayOrder) return;
+    const total = parseFloat((displayOrder.total || "0").replace(/[^0-9.]/g, ""));
+    // Partial only lowers the amount for down-payment tier orders; full tier
+    // and online none-tier orders always pay the full total up front.
+    const required =
+      displayOrder.downPaymentRequired && paymentChoice === "partial"
+        ? (displayOrder.downPaymentAmount ?? total * 0.5)
+        : (displayOrder.fullPaymentAmount ?? total);
+    setAmountPaid(required.toFixed(2));
+  }, [displayOrder, paymentChoice]);
+
+  const selectedMethod = isOnline
+    ? paymentMethodsStore.findByName(paymentMethod)
+    : undefined;
+  const methodUnavailable =
+    isOnline && !onlineMethods.some((m) => m.name === paymentMethod);
+  const isGcash = paymentMethod.toLowerCase() === "gcash";
+
+  // Live online payment methods that admin manages
+  useEffect(() => {
+    const loadMethods = () =>
+      setOnlineMethods(paymentMethodsStore.getPaymentMethods());
+    loadMethods();
+    const unsubscribe = paymentMethodsStore.subscribe(loadMethods);
+    return unsubscribe;
+  }, []);
+
+  // Load payment method from navigation state or the persisted order
   useEffect(() => {
     if (location.state?.paymentMethod) {
       setPaymentMethod(location.state.paymentMethod);
     } else if (orderId) {
-      const savedOrder = localStorage.getItem(
-        `order_${orderId}`,
-      );
-      if (savedOrder) {
-        try {
-          const orderData = JSON.parse(savedOrder);
-          if (orderData.paymentMethod) {
-            setPaymentMethod(orderData.paymentMethod);
-          }
-        } catch (error) {
-          console.error("Error loading order data:", error);
-        }
-      }
+      const saved = dataStore.getOrderById(orderId)?.paymentMethod;
+      if (saved) setPaymentMethod(saved);
     }
   }, [location.state, orderId]);
 
-  // Simulate OCR scanning to extract reference number from image
+  // Default to the first available online method if none chosen yet
+  useEffect(() => {
+    if (!paymentMethod && onlineMethods.length > 0) {
+      setPaymentMethod(onlineMethods[0].name);
+    }
+  }, [onlineMethods, paymentMethod]);
+
+  // OCR scan to extract the GCash reference number from the uploaded image.
+  // The image is preprocessed (grayscale + contrast boost) so light-gray
+  // "Ref No." / "Reference Number" labels are readable, then the digits after
+  // the label are extracted even when the number wraps across two lines.
   const scanReferenceNumber = async (file: File) => {
     setIsScanning(true);
     toast.info("Scanning image for reference number...");
+    try {
+      const worker = await getOcrWorker();
+      const canvas = await preprocessImage(file);
+      const result = await worker.recognize(canvas);
+      const text = result.data.text;
 
-    // Simulate OCR processing delay
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+      let ref = extractReferenceNumber(text);
 
-    // Generate a mock reference number (in production, use actual OCR)
-    const mockReferenceNumber = `REF${Math.floor(100000000 + Math.random() * 900000000)}`;
+      // Cap length defensively (GCash references are ~13 digits).
+      ref = ref.slice(0, 20);
 
-    setReferenceNumber(mockReferenceNumber);
-    setIsScanning(false);
-    toast.success("Reference number detected and auto-filled!");
+      if (ref.length >= 6) {
+        // Suggest, never silently overwrite what the customer already typed —
+        // OCR mis-reads a digit often enough that replacing a correct reference
+        // with a wrong one blocks staff verification (F31).
+        if (referenceNumber.trim()) {
+          setDetectedReference(ref);
+          toast.info(
+            "A reference number was found in the image. Review it and use it if it matches.",
+          );
+        } else {
+          setReferenceNumber(ref);
+          setDetectedReference("");
+          setReferenceError("");
+          toast.success("Reference number detected. Please review it before submitting.");
+        }
+      } else {
+        toast.error(
+          "Could not detect a reference number. Please enter it manually.",
+        );
+      }
+    } catch (err) {
+      console.error("OCR failed:", err);
+      toast.error(
+        "Could not read the image. Please enter the reference number manually.",
+      );
+    } finally {
+      setIsScanning(false);
+    }
   };
 
   const handleFileUpload = async (
@@ -146,12 +410,13 @@ export default function PaymentVerification() {
       }
 
       setProofFile(file);
+      setProofError("");
       // Create preview URL
       const url = URL.createObjectURL(file);
       setImagePreviewUrl(url);
 
-      // Auto-scan for reference number if digital payment (not cash)
-      if (paymentMethod !== "cash") {
+      // Auto-scan for reference number ONLY for GCash payments
+      if (isGcash) {
         await scanReferenceNumber(file);
       }
     }
@@ -161,32 +426,210 @@ export default function PaymentVerification() {
     setShowImagePreview(true);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleRemoveFile = () => {
+    setProofFile(null);
+    setImagePreviewUrl(null);
+    setReferenceNumber("");
+    setDetectedReference("");
+    setFileError("");
+    setProofError("");
+  };
 
-    if (paymentMethod === "gcash") {
-      if (!referenceNumber.trim()) {
-        toast.error("Please enter a GCash reference number");
+  // Validate the online payment form: mark the field that needs fixing, show the
+  // reason under it, and move focus there. A toast alone leaves the form looking
+  // untouched once it disappears.
+  const validatePaymentForm = () => {
+    const methodName = selectedMethod?.name || "payment";
+    const nextReferenceError = !referenceNumber.trim()
+      ? `Enter the ${methodName} reference number from your receipt.`
+      : "";
+    const nextProofError = !proofFile
+      ? "Upload a screenshot or receipt showing this payment."
+      : "";
+
+    setReferenceError(nextReferenceError);
+    setProofError(nextProofError);
+
+    const firstInvalid = nextReferenceError
+      ? document.getElementById("reference")
+      : nextProofError
+        ? document.getElementById("proof-field")
+        : null;
+    firstInvalid?.focus();
+
+    return !nextReferenceError && !nextProofError;
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+    if (paymentMethod !== "cash") {
+      if (!validatePaymentForm()) {
         return;
       }
 
-      // Save the reference number to the order in dataStore
-      // The payment will remain unverified until admin/staff manually verifies it
-      const order = dataStore.getOrders().find((o) => o.id === orderId);
-      if (order) {
-        dataStore.updateOrder(orderId!, {
-          paymentReferenceNumber: referenceNumber,
-          paymentVerified: false,
-          paymentProofUrl: imagePreviewUrl || undefined,
-        });
-
-        toast.success("Payment details submitted. Awaiting verification by staff.");
+      const paid = parseFloat(amountPaid);
+      if (isNaN(paid) || paid <= 0) {
+        toast.error("Payment amount is not available yet. Please try again.");
+        return;
       }
+
+      const existingOrder = dataStore.getOrderById(orderId!);
+
+      try {
+        // Upload the proof to Supabase Storage, then let the submit_payment RPC
+        // record the pending payment, apply the Partial/Full choice and clear
+        // the checkout deadline in one server-side transaction.
+        const proofStoragePath = proofFile
+          ? await uploadObjectAndGetPath({
+              bucket: BUCKETS.paymentProofs,
+              folder: `${user?.id ?? "anonymous"}/proofs/${orderId}`,
+              file: proofFile,
+              fileName: proofFile.name,
+            })
+          : null;
+
+        await submitPayment({
+          orderId: orderId!,
+          methodId: selectedMethod?.id ?? null,
+          methodName: selectedMethod?.name ?? paymentMethod,
+          referenceNumber,
+          proofStoragePath,
+          amountChoice: paymentChoice === "full" ? "full" : "down",
+        });
+      } catch (err) {
+        showDbError("submitting your payment", err);
+        return;
+      }
+
+      if (existingOrder) {
+        notificationStore.addNotification(
+          "order",
+          "New Order — Payment Verification Pending",
+          `New order #${existingOrder.displayId ?? orderId} from the customer is awaiting ${paymentMethod} payment verification. Received reference: ${referenceNumber}.`,
+          { clickable: true, relatedOrderId: orderId, recipientRole: "admin" },
+        );
+        notificationStore.addNotification(
+          "order",
+          "New Order — Payment Verification Pending",
+          `New order #${existingOrder.displayId ?? orderId} from the customer is awaiting ${paymentMethod} payment verification. Received reference: ${referenceNumber}.`,
+          { clickable: true, relatedOrderId: orderId, recipientRole: "staff" },
+        );
+      }
+
+      toast.success("Payment details submitted. Awaiting verification by staff.");
     }
+
+    // The order's checkout draft is cleared only now — a submit that throws
+    // before this line keeps the draft, so the "New Print Request" redirect can
+    // never drop an unfinished order.
+    clearPrintDraft();
 
     // Show success dialog instead of navigating immediately
     setShowSuccessDialog(true);
+    } finally {
+      setSubmitting(false);
+    }
   };
+
+  const selectMethod = (value: string) => {
+    setPaymentMethod(value);
+    setShowPaymentMethodSelector(false);
+    setReferenceNumber("");
+    setProofFile(null);
+    setImagePreviewUrl(null);
+    setPaymentChoice("partial");
+  };
+
+  const handleCancelOrder = async () => {
+    if (!orderId) return;
+    const reason = "Canceled by customer before payment.";
+    const existingOrder = dataStore.getOrderById(orderId);
+    try {
+      await dataStore.updateOrder(orderId, {
+        status: "Canceled",
+        cancellationReason: reason,
+      });
+    } catch (err) {
+      showDbError("canceling the order", err);
+      return;
+    }
+    notificationStore.addNotification(
+      "order",
+      "Order Canceled by Customer",
+      `Order #${existingOrder?.displayId ?? orderId} was canceled by the customer before payment verification.`,
+      { clickable: true, relatedOrderId: orderId, recipientRole: "admin" },
+    );
+    notificationStore.addNotification(
+      "order",
+      "Order Canceled by Customer",
+      `Order #${existingOrder?.displayId ?? orderId} was canceled by the customer before payment verification.`,
+      { clickable: true, relatedOrderId: orderId, recipientRole: "staff" },
+    );
+    setShowCancelConfirm(false);
+    toast.success("Order has been canceled.");
+    goToNewRequest();
+  };
+
+  // A canceled order no longer has a payment to verify — show a canceled state
+  // instead of the payment form so the page never reads as "Awaiting Payment".
+  if (order?.status === "Canceled") {
+    return (
+      <Layout
+        menuItems={menuItems}
+        title="Payment Verification"
+        showBackButton
+        backButtonPath="/customer/orders"
+        hideMobileBackButton
+      >
+        <div className="max-w-3xl mx-auto space-y-4">
+          <div>
+            <h2 className="text-3xl font-semibold text-gray-900">
+              Payment Verification
+            </h2>
+            <p className="text-gray-500 mt-1">
+              Order ID: {displayOrder?.displayId ?? orderId}
+            </p>
+          </div>
+          <Card className="p-6 bg-red-50 border border-red-200">
+            <div className="flex items-start gap-3">
+              <XCircle className="w-6 h-6 text-red-500 mt-0.5 flex-shrink-0" />
+              <div>
+                <h3 className="font-semibold text-red-900 mb-1">
+                  This order has been canceled
+                </h3>
+                <p className="text-sm text-red-700">
+                  Order #{displayOrder?.displayId ?? orderId} was canceled before payment was
+                  verified, so there is no payment to confirm. The order will
+                  no longer be processed.
+                  {order.cancellationReason
+                    ? ` Reason: ${order.cancellationReason}`
+                    : ""}
+                </p>
+              </div>
+            </div>
+          </Card>
+          <div className="flex gap-3">
+            <Button
+              variant="outline"
+              onClick={goToNewRequest}
+              className="flex-1"
+            >
+            New Print Request
+          </Button>
+            <Button
+              variant="outline"
+              onClick={goToNewRequest}
+              className="flex-1"
+            >
+              Back to Print Request
+            </Button>
+          </div>
+        </div>
+      </Layout>
+    );
+  }
 
   return (
     <Layout
@@ -194,61 +637,133 @@ export default function PaymentVerification() {
       title="Payment Verification"
       showBackButton
       backButtonPath="/customer/new-request"
+      hideMobileBackButton
     >
-      <div className="max-w-3xl mx-auto space-y-8">
+      {hydrating && (
+        <div className="mx-auto max-w-3xl">
+          <DetailSkeleton blocks={3} label="Loading your order" />
+        </div>
+      )}
+      <div className={hydrating ? "hidden" : "max-w-3xl mx-auto space-y-4"}>
+        {/* Back to previous step (returns to the resumed print request) */}
+        <button
+          type="button"
+          onClick={() =>
+            navigate("/customer/new-request", {
+              state: { fromPaymentVerification: true },
+            })
+          }
+          aria-label="Go back"
+          className="md:hidden inline-flex items-center gap-1 rounded-xl p-2 pl-0 text-gray-600 hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]"
+        >
+          <ArrowLeft className="h-5 w-5" />
+          <span className="text-sm font-medium">Back</span>
+        </button>
+        <div className="hidden md:block">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() =>
+              navigate("/customer/new-request", {
+                state: { fromPaymentVerification: true },
+              })
+            }
+            className="bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 hover:text-gray-900"
+          >
+            <ArrowLeft className="w-4 h-4 mr-2" />
+            Go Back
+          </Button>
+        </div>
+
         {/* Header */}
         <div>
-          <h1 className="text-3xl font-semibold text-gray-900">
+          <h2 className="text-3xl font-semibold text-gray-900">
             Payment Verification
-          </h1>
+          </h2>
           <p className="text-gray-500 mt-1">
-            Order ID: {orderId}
+            Order ID: {displayOrder?.displayId ?? orderId}
           </p>
         </div>
 
-        {/* Alert */}
-        <Alert>
-          <AlertCircle className="h-4 w-4" />
-          <AlertDescription>
-            Your order total requires payment verification
-            before processing can begin.
-          </AlertDescription>
-        </Alert>
+        {/* ONE status card instead of three stacked boxes saying the same
+            thing. The heading states what the customer has to do now: before a
+            reference is sent nobody is waiting on an administrator, so
+            "Waiting for Admin Verification" was simply wrong (F21). */}
+        {isOnline && (
+          <Card
+            className={`p-6 border ${
+              displayOrder?.paymentReferenceNumber
+                ? "bg-yellow-50 border-blue-200"
+                : "bg-blue-50/60 border-blue-200"
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <AlertCircle className="w-5 h-5 text-blue-600 mt-0.5" />
+              <div>
+                <h3 className="font-semibold text-gray-900 mb-1">
+                  {displayOrder?.paymentReferenceNumber
+                    ? "Waiting for Admin Verification"
+                    : "Submit your payment reference"}
+                </h3>
+                <p className="text-sm text-gray-600">
+                  {displayOrder?.paymentReferenceNumber
+                    ? "We've received your reference. An administrator will verify the payment, and your order joins the queue once it's approved."
+                    : "Send the reference number and a screenshot of the receipt below. An administrator verifies the payment, and your order joins the queue once it's approved."}
+                </p>
+                {displayOrder?.paymentReferenceNumber ? (
+                  submittedAt && (
+                    <p className="mt-1.5 text-sm text-gray-600">
+                      Reference received{" "}
+                      <span className="font-semibold text-gray-900">
+                        {formatPHDateTime(submittedAt)}
+                      </span>
+                    </p>
+                  )
+                ) : (
+                  displayOrder?.paymentDeadline && (
+                    <p className="mt-1.5 text-sm text-gray-600">
+                      Submit it by{" "}
+                      <span className="font-semibold text-gray-900">
+                        {formatPHDateTime(displayOrder.paymentDeadline)}
+                      </span>{" "}
+                      <PaymentDeadlineCountdown
+                        deadline={displayOrder.paymentDeadline}
+                      />
+                      . An unpaid order is cancelled after that time.
+                    </p>
+                  )
+                )}
+              </div>
+            </div>
+          </Card>
+        )}
 
         {/* Payment Method Display/Selector */}
         <Card className="p-6 bg-white shadow-sm">
           {!showPaymentMethodSelector ? (
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
               <div>
                 <p className="text-sm text-gray-600 mb-2">
                   Selected Payment Method
                 </p>
                 <div className="flex items-center gap-3">
-                  <div
-                    className={`w-12 h-12 rounded-full flex items-center justify-center ${
-                      paymentMethod === "gcash"
-                        ? "bg-[#007DFF]"
-                        : "bg-blue-600"
-                    }`}
-                  >
-                    {paymentMethod === "gcash" && (
+                  <div className="w-12 h-12 rounded-xl flex items-center justify-center bg-[#1668D9]">
+                    {isOnline ? (
                       <Smartphone className="w-6 h-6 text-white" />
-                    )}
-                    {paymentMethod === "cash" && (
+                    ) : (
                       <Banknote className="w-6 h-6 text-white" />
                     )}
                   </div>
                   <div>
                     <p className="font-semibold text-gray-900">
-                      {paymentMethod === "gcash" && "GCash"}
-                      {paymentMethod === "cash" &&
-                        "Cash on Pickup"}
+                      {isOnline
+                        ? paymentMethod
+                        : "Cash on Pickup"}
                     </p>
                     <p className="text-sm text-gray-500">
-                      {paymentMethod === "gcash" &&
-                        "Mobile wallet payment"}
-                      {paymentMethod === "cash" &&
-                        "Pay when you collect"}
+                      {isOnline
+                        ? "Mobile wallet payment"
+                        : "Pay when you collect"}
                     </p>
                   </div>
                 </div>
@@ -258,7 +773,7 @@ export default function PaymentVerification() {
                 onClick={() =>
                   setShowPaymentMethodSelector(true)
                 }
-                className="border-[#2F6FD6] text-[#2F6FD6] hover:bg-white border-2 border-blue-200"
+                className="w-full sm:w-auto"
               >
                 Change Payment Method
               </Button>
@@ -281,107 +796,110 @@ export default function PaymentVerification() {
                 </Button>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                {/* GCash Button */}
-                <button
-                  onClick={() => {
-                    setPaymentMethod("gcash");
-                    setShowPaymentMethodSelector(false);
-                    setReferenceNumber("");
-                    setProofFile(null);
-                    setImagePreviewUrl(null);
-                  }}
-                  className={`p-3 rounded-lg border-2 transition-all hover:shadow-sm ${
-                    paymentMethod === "gcash"
-                      ? "border-[#007DFF] bg-white border-2 border-blue-200"
-                      : "border-gray-200 hover:border-blue-300"
-                  }`}
-                >
-                  <div className="flex flex-col items-center gap-2">
-                    <div
-                      className={`w-10 h-10 rounded-full flex items-center justify-center ${
-                        paymentMethod === "gcash"
-                          ? "bg-[#007DFF]"
-                          : "bg-gray-100"
+              <div
+                role="radiogroup"
+                aria-label="Select payment method"
+                className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4"
+              >
+                {/* Online Payment Options (managed by admin) */}
+                {onlineMethods.map((method) => {
+                  const isSelected = paymentMethod === method.name;
+                  return (
+                    <button
+                      key={method.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={isSelected}
+                      onClick={() => selectMethod(method.name)}
+                      className={`flex items-center gap-3 rounded-xl border-2 p-3 text-left transition-all active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]/40 ${
+                        isSelected
+                          ? "border-[#1668D9] bg-[#EAF2FF] shadow-[0_8px_20px_rgba(22,104,217,0.14)]"
+                          : "border-gray-200 bg-white hover:border-gray-300 hover:bg-slate-50/60"
                       }`}
                     >
-                      <Smartphone
-                        className={`w-5 h-5 ${
-                          paymentMethod === "gcash"
-                            ? "text-white"
-                            : "text-gray-600"
-                        }`}
-                      />
-                    </div>
-                    <div className="text-center">
-                      <p
-                        className={`text-xs font-semibold ${
-                          paymentMethod === "gcash"
-                            ? "text-[#007DFF]"
-                            : "text-gray-900"
+                      {/* 22px bullseye: brand ring → white gap → brand core */}
+                      <span
+                        aria-hidden="true"
+                        className={`flex size-[22px] shrink-0 items-center justify-center rounded-full border-2 bg-white ${
+                          isSelected ? "border-[#1668D9]" : "border-slate-300"
                         }`}
                       >
-                        GCash
-                      </p>
-                      <p className="text-[9px] text-gray-500">
-                        Mobile wallet
-                      </p>
-                    </div>
-                    {paymentMethod === "gcash" && (
-                      <CheckCircle2 className="w-4 h-4 text-[#007DFF]" />
-                    )}
-                  </div>
-                </button>
+                        {isSelected && (
+                          <span className="size-[10px] rounded-full bg-[#1668D9]" />
+                        )}
+                      </span>
+                      <span
+                        className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors ${
+                          isSelected ? "bg-[#1668D9]" : "bg-blue-100"
+                        }`}
+                      >
+                        <Smartphone
+                          className={`h-5 w-5 ${
+                            isSelected ? "text-white" : "text-[#2F6FD6]"
+                          }`}
+                        />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span
+                          className={`block truncate text-sm font-semibold ${
+                            isSelected ? "text-[#10316B]" : "text-gray-900"
+                          }`}
+                        >
+                          {method.name}
+                        </span>
+                        <span className="block text-xs text-gray-500">
+                          Pay via {method.name} mobile wallet
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
 
                 {/* Cash on Pickup Button */}
                 <button
-                  onClick={() => {
-                    setPaymentMethod("cash");
-                    setShowPaymentMethodSelector(false);
-                    setReferenceNumber("");
-                    setProofFile(null);
-                    setImagePreviewUrl(null);
-                  }}
-                  className={`p-3 rounded-lg border-2 transition-all hover:shadow-sm ${
+                  type="button"
+                  role="radio"
+                  aria-checked={paymentMethod === "cash"}
+                  onClick={() => selectMethod("cash")}
+                  className={`flex items-center gap-3 rounded-xl border-2 p-3 text-left transition-all active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]/40 ${
                     paymentMethod === "cash"
-                      ? "border-blue-600 bg-white border-2 border-blue-200"
-                      : "border-gray-200 hover:border-blue-300"
+                      ? "border-[#1668D9] bg-[#EAF2FF] shadow-[0_8px_20px_rgba(22,104,217,0.14)]"
+                      : "border-gray-200 bg-white hover:border-gray-300 hover:bg-slate-50/60"
                   }`}
                 >
-                  <div className="flex flex-col items-center gap-2">
-                    <div
-                      className={`w-10 h-10 rounded-full flex items-center justify-center ${
-                        paymentMethod === "cash"
-                          ? "bg-blue-600"
-                          : "bg-gray-100"
+                  <span
+                    aria-hidden="true"
+                    className={`flex size-[22px] shrink-0 items-center justify-center rounded-full border-2 bg-white ${
+                      paymentMethod === "cash" ? "border-[#1668D9]" : "border-slate-300"
+                    }`}
+                  >
+                    {paymentMethod === "cash" && (
+                      <span className="size-[10px] rounded-full bg-[#1668D9]" />
+                    )}
+                  </span>
+                  <span
+                    className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors ${
+                      paymentMethod === "cash" ? "bg-[#1668D9]" : "bg-blue-100"
+                    }`}
+                  >
+                    <Banknote
+                      className={`h-5 w-5 ${
+                        paymentMethod === "cash" ? "text-white" : "text-[#2F6FD6]"
+                      }`}
+                    />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span
+                      className={`block truncate text-sm font-semibold ${
+                        paymentMethod === "cash" ? "text-[#10316B]" : "text-gray-900"
                       }`}
                     >
-                      <Banknote
-                        className={`w-5 h-5 ${
-                          paymentMethod === "cash"
-                            ? "text-white"
-                            : "text-gray-600"
-                        }`}
-                      />
-                    </div>
-                    <div className="text-center">
-                      <p
-                        className={`text-xs font-semibold ${
-                          paymentMethod === "cash"
-                            ? "text-blue-600"
-                            : "text-gray-900"
-                        }`}
-                      >
-                        Cash on Pickup
-                      </p>
-                      <p className="text-[9px] text-gray-500">
-                        Pay on collect
-                      </p>
-                    </div>
-                    {paymentMethod === "cash" && (
-                      <CheckCircle2 className="w-4 h-4 text-blue-600" />
-                    )}
-                  </div>
+                      Cash on Pickup
+                    </span>
+                    <span className="block text-xs text-gray-500">
+                      Pay when you collect your order
+                    </span>
+                  </span>
                 </button>
               </div>
             </>
@@ -389,78 +907,21 @@ export default function PaymentVerification() {
         </Card>
 
         {/* Payment Instructions - Show based on selected method */}
-        {paymentMethod === "gcash" && (
+        {isOnline && (
           <Card className="p-6 bg-white shadow-sm">
             <h2 className="text-xl font-semibold text-gray-900 mb-6">
-              GCash Payment Details
+              {paymentMethod} Payment Details
             </h2>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* GCash QR Code */}
-              <div className="space-y-4">
-                <div className="p-4 bg-white border-2 border-blue-200 rounded-lg">
-                  <h3 className="font-semibold text-gray-900 mb-3 flex items-center gap-2">
-                    <span className="bg-[#007DFF] text-white px-3 py-1 rounded text-sm">
-                      GCash
-                    </span>
-                    Scan to Pay
-                  </h3>
-                  <div className="bg-white p-4 rounded-lg inline-block">
-                    <img
-                      src={GCASH_QR_CODE}
-                      alt="GCash QR Code"
-                      className="w-48 h-48 mx-auto"
-                    />
-                  </div>
-                  <p className="text-xs text-gray-600 mt-3">
-                    Scan this QR code with your GCash app to pay
-                  </p>
-                </div>
+            {methodUnavailable ? (
+              <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+                This payment method is no longer available. Please
+                change your payment method above and submit a new
+                payment.
               </div>
-
-              {/* GCash Account Details */}
-              <div className="space-y-4">
-                <div className="p-4 bg-white border-2 border-blue-200 rounded-lg">
-                  <h3 className="font-semibold text-gray-900 mb-3">
-                    GCash Account Details
-                  </h3>
-                  <div className="space-y-2 text-sm">
-                    <div>
-                      <span className="text-gray-600">
-                        Account Name:
-                      </span>
-                      <p className="font-medium text-gray-900">
-                        DocuFy Printing Services
-                      </p>
-                    </div>
-                    <div>
-                      <span className="text-gray-600">
-                        Mobile Number:
-                      </span>
-                      <p className="font-medium text-gray-900 font-mono">
-                        0917 123 4567
-                      </p>
-                    </div>
-                    <div>
-                      <span className="text-gray-600">
-                        Payment Method:
-                      </span>
-                      <p className="font-medium text-gray-900">
-                        GCash Mobile Wallet
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="p-4 bg-white border-2 border-blue-200 rounded-lg">
-                  <p className="text-sm text-amber-800">
-                    <strong>Note:</strong> After payment, upload
-                    your screenshot and enter the reference
-                    number below.
-                  </p>
-                </div>
-              </div>
-            </div>
+            ) : selectedMethod ? (
+              <PaymentMethodQRPanel method={selectedMethod} />
+            ) : null}
           </Card>
         )}
 
@@ -476,74 +937,200 @@ export default function PaymentVerification() {
                 </div>
                 <div>
                   <h3 className="font-semibold text-gray-900 mb-2">
-                    Payment on Pickup
+                    Pay at the Shop before Printing
                   </h3>
                   <p className="text-sm text-gray-700 mb-3">
-                    You have selected to pay in cash when you
-                    collect your order. Please ensure you have
-                    the exact amount ready.
+                    Your order will only be printed once you pay in cash at the
+                    shop. Please bring the amount below and have the staff
+                    confirm your payment.
                   </p>
                   <div className="space-y-2 text-sm">
                     <div className="flex items-start gap-2">
                       <CheckCircle2 className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
                       <p className="text-gray-700">
-                        No advance payment required
+                        Amount to pay:{" "}
+                        <strong>
+                          {displayOrder?.downPaymentRequired
+                            ? formatCurrency(displayOrder.downPaymentAmount || 0)
+                            : displayOrder?.total || formatCurrency(0)}
+                        </strong>
+                        {displayOrder?.downPaymentRequired && (
+                          <span className="text-gray-500">
+                            {" "}
+                            (50% down payment —{" "}
+                            {formatCurrency(
+                              orderTotal - (displayOrder.downPaymentAmount || 0),
+                            )}{" "}
+                            balance on pickup)
+                          </span>
+                        )}
                       </p>
                     </div>
                     <div className="flex items-start gap-2">
                       <CheckCircle2 className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
                       <p className="text-gray-700">
-                        Pay the full amount when collecting your
-                        order
+                        Payment deadline:{" "}
+                        <span className="font-mono font-semibold">
+                          {displayOrder?.paymentDeadline
+                            ? formatPHDateTime(displayOrder.paymentDeadline)
+                            : "to be announced"}
+                        </span>{" "}
+                        {displayOrder?.paymentDeadline && (
+                          <PaymentDeadlineCountdown
+                            deadline={displayOrder.paymentDeadline}
+                          />
+                        )}
                       </p>
                     </div>
                     <div className="flex items-start gap-2">
                       <CheckCircle2 className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
                       <p className="text-gray-700">
-                        Please bring exact change if possible
+                        Unpaid orders are auto-cancelled once the deadline
+                        passes.
                       </p>
                     </div>
                   </div>
                 </div>
               </div>
             </div>
+            <div className="mt-4">
+              <CashOnPickupAcknowledgement
+                checked={cashAcknowledged}
+                onChange={setCashAcknowledged}
+              />
+            </div>
           </Card>
         )}
 
         {/* Reference Form - For digital payments (not cash) */}
-        {paymentMethod !== "cash" && (
-          <Card className="p-6 bg-white shadow-sm">
-            <h2 className="text-xl font-semibold text-gray-900 mb-6">
+        {isOnline && (
+          <Card className="p-6 bg-white shadow-sm gap-0">
+            <h2 className="text-xl font-semibold text-gray-900 mb-3">
               Submit Payment Reference
             </h2>
 
-            <form onSubmit={handleSubmit} className="space-y-6">
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (paymentMethod !== "cash" && !validatePaymentForm()) {
+                  return;
+                }
+                setShowSubmitConfirm(true);
+              }}
+              className="space-y-6"
+            >
+              {displayOrder?.downPaymentRequired && (
+                <div className="space-y-2">
+                  <Label htmlFor="payment-choice">
+                    Payment Amount *
+                  </Label>
+                  <Select
+                    value={paymentChoice}
+                    onValueChange={(value) =>
+                      setPaymentChoice(value as "partial" | "full")
+                    }
+                  >
+                    <SelectTrigger id="payment-choice" className="w-full">
+                      <SelectValue placeholder="Select how much to pay" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="partial">
+                        Partial Payment —{" "}
+                        {formatCurrency(displayOrder.downPaymentAmount || orderTotal * 0.5)}{" "}
+                        (50% down)
+                      </SelectItem>
+                      <SelectItem value="full">
+                        Full Payment — {formatCurrency(orderTotal)}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {paymentChoice === "full" ? (
+                    <p className="text-sm text-gray-500">
+                      Paying the full amount now — no balance due on pickup.
+                    </p>
+                  ) : (
+                    <p className="text-sm text-gray-500">
+                      You're required to pay a 50% down payment of{" "}
+                      {formatCurrency(displayOrder.downPaymentAmount || 0)}. The remaining
+                      balance of{" "}
+                      {formatCurrency(orderTotal - (displayOrder.downPaymentAmount || 0))}{" "}
+                      will be due on pickup.
+                    </p>
+                  )}
+                </div>
+              )}
+
               <div className="space-y-2">
                 <Label htmlFor="reference">
-                  Reference Number *
+                  Reference Number <span className="text-red-500">*</span>
                 </Label>
                 <Input
                   id="reference"
                   type="text"
+                  alphaNumericOnly
+                  maxDigits={20}
                   value={referenceNumber}
-                  onChange={(e) =>
-                    setReferenceNumber(e.target.value)
-                  }
-                  placeholder="Enter payment reference number"
+                  onChange={(e) => {
+                    setReferenceNumber(e.target.value);
+                    if (referenceError) setReferenceError("");
+                  }}
+                  placeholder="e.g. G123456789"
+                  aria-invalid={!!referenceError || undefined}
+                  aria-describedby={describedBy(
+                    "reference-help",
+                    referenceError && "reference-error",
+                  )}
+                  aria-required="true"
                   required
+                  maxLength={20}
                 />
-                <p className="text-sm text-gray-500">
-                  {paymentMethod === "gcash" &&
-                    "Enter the reference number from your GCash receipt"}
+                <p id="reference-help" className="text-sm text-gray-500">
+                  Enter the reference number from your{" "}
+                  {selectedMethod?.name || "payment"} receipt
                 </p>
+                <FieldError id="reference-error" message={referenceError} />
+                {detectedReference && detectedReference !== referenceNumber && (
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border border-[#1668D9]/25 bg-[#F2F7FF] px-3 py-2">
+                    <span className="text-xs text-gray-700">
+                      Found in your image:{" "}
+                      <span className="font-mono font-semibold text-gray-900">
+                        {detectedReference}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setReferenceNumber(detectedReference);
+                        setDetectedReference("");
+                        setReferenceError("");
+                      }}
+                      className="inline-flex min-h-6 items-center rounded-md border border-[#1668D9]/30 bg-white px-2 py-0.5 text-xs font-semibold text-[#1668D9] hover:bg-[#1668D9] hover:text-white"
+                    >
+                      Use detected reference
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDetectedReference("")}
+                      className="inline-flex min-h-6 items-center px-1 text-xs font-medium text-gray-600 hover:text-gray-900"
+                    >
+                      Keep mine
+                    </button>
+                  </div>
+                )}
+                {isScanning && (
+                  <p className="text-sm text-[#2F6FD6] flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Scanning image for the reference number...
+                  </p>
+                )}
               </div>
 
               <div className="space-y-2">
                 <Label htmlFor="proof">
                   Upload Proof of Payment (Screenshot or
-                  Receipt)
+                  Receipt) <span className="text-red-500">*</span>
                 </Label>
-                <p className="text-sm text-gray-500 mb-2">
+                <p id="proof-help" className="text-sm text-gray-500 mb-2">
                   Image files only (JPG, PNG, GIF, WebP)
                 </p>
 
@@ -565,13 +1152,25 @@ export default function PaymentVerification() {
                 )}
 
                 {!proofFile ? (
-                  <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-[#2F6FD6] transition-colors">
+                  <div
+                    id="proof-field"
+                    tabIndex={-1}
+                    aria-describedby={describedBy(
+                      "proof-help",
+                      proofError && "proof-error",
+                    )}
+                    className={`rounded-lg border-2 border-dashed p-8 text-center transition-colors outline-none focus-visible:border-[#2F6FD6] ${
+                      proofError
+                        ? "border-[#B42318] bg-[#FEF3F2]"
+                        : "border-gray-300 hover:border-[#2F6FD6]"
+                    }`}
+                  >
                     <Image className="w-12 h-12 text-gray-400 mx-auto mb-3" />
                     <p className="text-gray-700 mb-4 font-medium">
                       Upload Payment Screenshot
                     </p>
                     <label className="inline-block cursor-pointer">
-                      <span className="px-6 py-2 bg-[#2F6FD6] text-white rounded-lg hover:bg-[#2557b8] transition-colors font-medium inline-flex items-center gap-2">
+                      <span className="px-6 py-2 bg-white text-slate-700 rounded-lg border-2 border-blue-200 hover:bg-brand hover:border-brand hover:text-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md font-medium inline-flex items-center gap-2">
                         <Upload className="w-4 h-4" />
                         Choose Image File
                       </span>
@@ -586,11 +1185,11 @@ export default function PaymentVerification() {
                   </div>
                 ) : (
                   <div className="p-4 bg-white border-2 border-blue-200 rounded-lg">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <Image className="w-5 h-5 text-blue-600" />
-                        <div>
-                          <p className="text-sm font-medium text-gray-900">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <Image className="w-5 h-5 text-blue-600 shrink-0" />
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-gray-900 break-words">
                             {proofFile.name}
                           </p>
                           <p className="text-xs text-gray-600">
@@ -599,19 +1198,16 @@ export default function PaymentVerification() {
                           </p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <Button
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
                           type="button"
-                          variant="outline"
-                          size="sm"
                           onClick={handleViewImage}
-                          className="text-[#2F6FD6] border-[#2F6FD6] hover:bg-[#2F6FD6] hover:text-white"
+                          className="px-3 py-1 text-sm bg-white border-2 border-blue-200 text-slate-700 rounded hover:bg-brand hover:border-brand hover:text-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
                         >
-                          <Eye className="w-4 h-4 mr-1" />
                           View
-                        </Button>
+                        </button>
                         <label className="cursor-pointer">
-                          <span className="px-3 py-1 text-sm bg-white border border-[#2F6FD6] text-[#2F6FD6] rounded hover:bg-[#2F6FD6] hover:text-white transition-colors">
+                          <span className="px-3 py-1 text-sm bg-white border-2 border-blue-200 text-slate-700 rounded hover:bg-brand hover:border-brand hover:text-white transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md">
                             Change
                           </span>
                           <Input
@@ -621,26 +1217,37 @@ export default function PaymentVerification() {
                             className="hidden"
                           />
                         </label>
+                        <button
+                          type="button"
+                          onClick={handleRemoveFile}
+                          title="Remove file"
+                          className="p-1.5 text-red-500 rounded hover:bg-red-500 hover:text-white transition-all"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
                       </div>
                     </div>
                   </div>
                 )}
               </div>
 
-              <div className="flex gap-3">
+              <FieldError id="proof-error" message={proofError} />
+
+              <div className="flex flex-col-reverse gap-2 sm:flex-row sm:gap-3">
                 <Button
                   type="button"
-                  variant="outline"
-                  onClick={() =>
-                    navigate("/customer/dashboard")
-                  }
-                  className="flex-1"
+                  variant="destructive-outline"
+                  onClick={() => setShowCancelConfirm(true)}
+                  className="w-full h-11 sm:flex-1 sm:h-9"
                 >
-                  Cancel
+                  Cancel Order
                 </Button>
                 <Button
                   type="submit"
-                  className="flex-1 bg-[#2F6FD6] hover:bg-[#2557b8]"
+                  variant="primary"
+                  loading={submitting}
+                  loadingText="Submitting..."
+                  className="w-full h-11 sm:flex-1 sm:h-9"
                 >
                   Submit Reference
                 </Button>
@@ -649,47 +1256,33 @@ export default function PaymentVerification() {
           </Card>
         )}
 
-        {/* Confirm Button for Cash Payment */}
+        {/* Cash on Pickup — no online confirmation; order is confirmed at the shop */}
         {paymentMethod === "cash" && (
           <Card className="p-6 bg-white shadow-sm">
-            <div className="flex gap-3">
+            <p className="text-sm text-gray-700 mb-1">
+              You've chosen <strong>Cash on Pickup</strong>. There is nothing to
+              submit online — your order is only confirmed when you pay in cash
+              at the shop.
+            </p>
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:gap-3">
               <Button
                 type="button"
                 variant="outline"
                 onClick={() => navigate("/customer/dashboard")}
                 className="flex-1"
               >
-                Cancel
+                Dashboard
               </Button>
               <Button
-                onClick={() =>
-                  navigate(`/customer/track/${orderId}`)
-                }
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                variant="primary"
+                onClick={() => navigate(`/customer/track/${orderId}`)}
+                className="flex-1"
               >
-                Confirm Order
+                Track Order
               </Button>
             </div>
           </Card>
         )}
-
-        {/* Status Card */}
-        <Card className="p-6 bg-yellow-50 border border-blue-200">
-          <div className="flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 text-blue-600 mt-0.5" />
-            <div>
-              <h3 className="font-semibold text-gray-900 mb-1">
-                Waiting for Admin Verification
-              </h3>
-              <p className="text-sm text-gray-600">
-                Once you submit your reference number, an
-                administrator will verify your payment. You'll
-                be notified when your order is approved and
-                begins processing.
-              </p>
-            </div>
-          </div>
-        </Card>
       </div>
 
       {/* Image Preview Dialog */}
@@ -729,8 +1322,8 @@ export default function PaymentVerification() {
         open={showSuccessDialog}
         onOpenChange={(open) => {
           if (!open) {
-            // If user closes dialog via X or clicking outside, redirect to order tracking
-            navigate(`/customer/track/${orderId}`);
+            // If user closes dialog via X or clicking outside, redirect to new print request
+            goToNewRequest();
           }
         }}
       >
@@ -745,15 +1338,18 @@ export default function PaymentVerification() {
               Print Request Received!
             </DialogTitle>
             <DialogDescription className="text-center pt-2">
-              Your payment details have been submitted successfully. Please wait for staff verification before your order begins processing.
+              {paymentMethod === "cash"
+                ? "Your order has been placed. Pay in cash at the shop before the payment deadline to confirm it."
+                : "Your payment details have been submitted successfully. Please wait for staff verification before your order begins processing."}
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3 mt-6">
             <Button
-              onClick={() => navigate(`/customer/track/${orderId}`)}
-              className="w-full bg-[#2F6FD6] hover:bg-[#2557b8]"
+              variant="primary"
+              onClick={goToNewRequest}
+              className="w-full h-11"
             >
-              See My Order
+              New Print Request
             </Button>
             <Button
               variant="outline"
@@ -765,6 +1361,63 @@ export default function PaymentVerification() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* Submit Payment Confirmation */}
+      {showSubmitConfirm && (
+        <ConfirmationDialog
+          open
+          onOpenChange={setShowSubmitConfirm}
+          onConfirm={async () => {
+            await handleSubmit({ preventDefault: () => {} } as React.FormEvent);
+            setShowSubmitConfirm(false);
+          }}
+          closeOnConfirm={false}
+          loadingText={paymentMethod === "cash" ? "Confirming..." : "Submitting..."}
+          title="Submit Payment for Verification?"
+          description={
+            paymentMethod === "cash"
+              ? "Your Cash on Pickup order cannot be confirmed online — visit the shop to pay in cash before the payment deadline. The staff will confirm your payment and queue your order."
+              : `Submit a payment of ?${amountPaid || "0.00"} with reference ${referenceNumber.trim() || "number"}${imagePreviewUrl ? " and payment proof" : ""} for ${selectedMethod?.name || "online"} payment for order ${displayOrder?.displayId ?? orderId}? Once submitted, your payment will be queued for admin/staff verification and the order will not print until approved.`
+          }
+          confirmLabel={paymentMethod === "cash" ? "Confirm Order" : "Submit Reference"}
+          cancelLabel="Go Back"
+          destructive={false}
+        />
+      )}
+
+      {/* Cancel Order Confirmation */}
+      {showCancelConfirm && (
+        <ConfirmationDialog
+          open
+          onOpenChange={setShowCancelConfirm}
+          onConfirm={handleCancelOrder}
+          title="Cancel Order?"
+          description={
+            order
+              ? `Are you sure you want to cancel order #${displayOrder?.displayId ?? orderId}? This will permanently cancel the order and it can no longer be processed.`
+              : `This order has not been submitted yet — canceling will just discard the unsent request. It will not be recorded and will not appear in your orders.`
+          }
+          confirmLabel="Cancel Order"
+          cancelLabel="Keep Order"
+          destructive
+        />
+      )}
+
+      {/* Leave payment verification confirmation */}
+      {paymentBlocker && paymentBlocker.state === "blocked" && (
+        <ConfirmationDialog
+          open
+          onOpenChange={(open) => {
+            if (!open && paymentBlocker.state === "blocked") paymentBlocker.reset();
+          }}
+          onConfirm={() => paymentBlocker.proceed()}
+          title="Leave payment verification?"
+          description="You haven't finished submitting your payment yet. Leaving now means your entered reference details and proof will be lost — you can come back and submit again from My Orders."
+          confirmLabel="Leave Page"
+          cancelLabel="Stay Here"
+          destructive={false}
+        />
+      )}
     </Layout>
   );
 }

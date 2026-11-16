@@ -7,38 +7,18 @@ import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Textarea } from './ui/textarea';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from './ui/dialog';
-import { toast } from 'sonner';
-import logoImage from 'figma:asset/32cd46dac3d06839e0db69b6c6ad22c9a8ac17a6.png';
-
-// Mock job data (shared with admin job board)
-const mockJobs = [
-  {
-    id: 'JOB-001',
-    title: 'Part-Time Print Shop Assistant',
-    description: 'Assist customers with printing needs, operate printing equipment, and handle basic administrative tasks.',
-    requirements: 'Good communication skills, basic computer knowledge, flexible schedule',
-    salary: '₱150/hour',
-    schedule: 'Mon-Fri, 3-4 hours/day',
-    status: 'active' as const,
-    postedDate: new Date('2026-04-10'),
-  },
-  {
-    id: 'JOB-002',
-    title: 'Student Printing Technician',
-    description: 'Manage printing queue, troubleshoot printer issues, and ensure quality output.',
-    requirements: 'Tech-savvy, detail-oriented, previous printing experience preferred',
-    salary: '₱180/hour',
-    schedule: 'Flexible weekday shifts',
-    status: 'active' as const,
-    postedDate: new Date('2026-04-08'),
-  },
-];
+import { usePopup } from '../contexts/PopupContext';
+import { useLogo } from "../hooks/useLogo";
+import { jobsStore } from '../utils/jobsStore';
 
 export default function PublicJobApplication() {
+  const { showPopup } = usePopup();
   const navigate = useNavigate();
+  const logo = useLogo();
   const { jobId } = useParams();
   const [formData, setFormData] = useState({
-    fullName: '',
+    firstName: '',
+    lastName: '',
     email: '',
     phone: '',
     address: '',
@@ -48,7 +28,7 @@ export default function PublicJobApplication() {
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   const [showSuccessDialog, setShowSuccessDialog] = useState(false);
 
-  const job = mockJobs.find(j => j.id === jobId);
+  const job = jobsStore.getJobById(jobId || '');
 
   if (!job) {
     return (
@@ -57,7 +37,7 @@ export default function PublicJobApplication() {
           <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
           <h2 className="text-2xl font-semibold mb-2">Job Not Found</h2>
           <p className="text-gray-600 mb-4">The job posting you're looking for doesn't exist or has been removed.</p>
-          <Button onClick={() => navigate('/')} className="bg-[#1D73EC] hover:bg-[#10316B]">
+          <Button onClick={() => navigate('/')} className="bg-white text-[#1668D9] border-2 border-blue-200 hover:bg-[#1668D9] hover:text-white">
             Back to Home
           </Button>
         </Card>
@@ -67,8 +47,8 @@ export default function PublicJobApplication() {
 
   const handleSubmit = () => {
     // Validate form
-    if (!formData.fullName || !formData.email || !formData.phone) {
-      toast.error('Please fill in all required fields');
+    if (!formData.firstName || !formData.lastName || !formData.email || !formData.phone) {
+      showPopup('Please fill in all required fields', 'error');
       return;
     }
     
@@ -95,13 +75,13 @@ export default function PublicJobApplication() {
       <header className="border-b border-gray-200 bg-white backdrop-blur-md sticky top-0 z-50 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <img src={logoImage} alt="DocuFy Logo" className="w-12 h-12 rounded-full" />
+            <img src={logo} alt="Docufy Logo" className="w-12 h-12 rounded-full" />
             <div>
-              <h1 className="text-xl font-bold text-[#1c1f26]">DocuFy</h1>
+              <h1 className="text-xl font-bold text-[#1c1f26]">Docufy</h1>
               <p className="text-xs text-gray-500">Your Printing Companion</p>
             </div>
           </div>
-          <Button variant="outline" onClick={() => navigate('/')} className="border-[#1D73EC] text-[#1D73EC] hover:bg-[#1D73EC] hover:text-white">
+          <Button variant="outline" onClick={() => navigate('/')} className="border-[#1668D9] text-[#1668D9] hover:bg-[#1668D9] hover:text-white">
             <ArrowLeft className="w-4 h-4 mr-2" />
             Back to Home
           </Button>
@@ -111,7 +91,7 @@ export default function PublicJobApplication() {
       {/* Main Content */}
       <div className="max-w-4xl mx-auto px-4 sm:px-6 py-8">
         {/* Job Details */}
-        <Card className="p-6 mb-6 bg-[#1D73EC] text-white">
+        <Card className="p-6 mb-6 bg-[#1668D9] text-white">
           <div className="flex items-start gap-4">
             <div className="w-12 h-12 bg-white/20 rounded-lg flex items-center justify-center flex-shrink-0">
               <Briefcase className="w-6 h-6" />
@@ -144,12 +124,23 @@ export default function PublicJobApplication() {
           <div className="space-y-4">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label htmlFor="fullName">Full Name <span className="text-red-500">*</span></Label>
+                <Label htmlFor="firstName">First Name <span className="text-red-500">*</span></Label>
                 <Input
-                  id="fullName"
-                  placeholder="Juan Dela Cruz"
-                  value={formData.fullName}
-                  onChange={(e) => setFormData(prev => ({ ...prev, fullName: e.target.value }))}
+                  id="firstName"
+                  placeholder="Juan"
+                  value={formData.firstName}
+                  onChange={(e) => setFormData(prev => ({ ...prev, firstName: e.target.value }))}
+                  maxLength={50}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="lastName">Last Name <span className="text-red-500">*</span></Label>
+                <Input
+                  id="lastName"
+                  placeholder="Dela Cruz"
+                  value={formData.lastName}
+                  onChange={(e) => setFormData(prev => ({ ...prev, lastName: e.target.value }))}
+                  maxLength={50}
                 />
               </div>
               <div className="space-y-2">
@@ -169,7 +160,8 @@ export default function PublicJobApplication() {
                 <Label htmlFor="phone">Phone Number <span className="text-red-500">*</span></Label>
                 <Input
                   id="phone"
-                  placeholder="+63 912 345 6789"
+                  type="tel"
+                  placeholder="09XXXXXXXXX"
                   value={formData.phone}
                   onChange={(e) => setFormData(prev => ({ ...prev, phone: e.target.value }))}
                 />
@@ -218,14 +210,14 @@ export default function PublicJobApplication() {
             <div className="flex gap-3 pt-4">
               <Button
                 onClick={handleSubmit}
-                className="flex-1 bg-[#1D73EC] hover:bg-[#10316B] text-white"
+                className="flex-1 bg-white text-[#1668D9] border-2 border-blue-200 hover:bg-[#1668D9] hover:text-white"
               >
                 Submit Application
               </Button>
               <Button
                 variant="outline"
                 onClick={() => navigate('/')}
-                className="border-gray-300"
+                className="bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200 hover:text-gray-900"
               >
                 Cancel
               </Button>
@@ -252,7 +244,7 @@ export default function PublicJobApplication() {
             <Button variant="outline" onClick={() => setShowConfirmDialog(false)}>
               Review Again
             </Button>
-            <Button onClick={confirmSubmit} className="bg-[#1D73EC] hover:bg-[#10316B]">
+            <Button onClick={confirmSubmit} className="bg-white text-[#1668D9] border-2 border-blue-200 hover:bg-[#1668D9] hover:text-white">
               Yes, Submit
             </Button>
           </DialogFooter>
@@ -274,7 +266,7 @@ export default function PublicJobApplication() {
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="sm:justify-center">
-            <Button onClick={() => navigate('/')} className="bg-[#1D73EC] hover:bg-[#10316B]">
+            <Button onClick={() => navigate('/')} className="bg-white text-[#1668D9] border-2 border-blue-200 hover:bg-[#1668D9] hover:text-white">
               Back to Home
             </Button>
           </DialogFooter>

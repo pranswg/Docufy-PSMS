@@ -1,22 +1,100 @@
-// Centralized data store for orders and inventory
-// This ensures all dashboards show consistent data
-import { orderCounter } from './orderCounter';
+// Centralized data store for orders.
+//
+// Supabase-backed facade: keeps the legacy synchronous read API
+// (getOrders / getOrdersByCustomer / getOrderById / getOrderStats / subscribe)
+// that every dashboard reads, hydrates once from the orders tables, refreshes
+// on realtime changes (`orders` + `payments` publication), and performs ALL
+// writes through the DB repos. The in-memory cache is mutated ONLY after a
+// successful write, so a failed RLS/network write is never silently reflected
+// in the UI (callers get an error to toast).
+import {
+  fetchOrders,
+  fetchOrderById,
+  upsertCostBreakdown,
+  insertStatusHistory,
+  updateOrder as dbUpdateOrder,
+  subscribeOrderChanges,
+  createCustomerOrderRpc,
+  createWalkInOrderRpc,
+} from '../../lib/db/ordersRepo';
+import { hasVerifiedPayment } from '../../lib/db/paymentsRepo';
+import { auditLogStore } from './auditLogStore';
+import { CASH_ON_PICKUP_BLOCKED_MESSAGE, effectivePolicy } from './unclaimedPolicy';
+import { findCustomerSummary, toUnclaimedOrderLikes } from './unclaimedOrders';
+import { restrictionsStore } from './restrictionsStore';
+import { landingContentStore } from './landingContentStore';
+import { resolveStorageUrl, BUCKETS, uploadObjectAndGetPath, removeObjectsIfPresent } from '../../lib/db/storage';
+import { formatOrderNumber } from '../../lib/db/types';
+import type { OrderDto, OrderFileDto } from '../../lib/db/types';
+import { authReady } from '../../lib/supabaseClient';
+
+export const MAX_ORDER_FILE_SIZE_BYTES = 50 * 1024 * 1024;
 
 export interface AttachedFile {
   name: string;
   size: string;
   type: string;
   url?: string;
+  storagePath?: string;
   uploadedAt?: string;
+  file?: File;
+  mimeType?: string;
+  sizeBytes?: number;
+  photoSize?: string;
+  photoQuantity?: number;
+  contentType?: string;
+  paperSize?: string;
+  orientation?: string;
+  printType?: string;
+  copies?: number;
+  twoSided?: string;
+  pagesPerSheet?: string;
+  colorMode?: string;
+  pageRange?: string;
+  specificPages?: string;
+  margins?: string;
+  scale?: string;
+  customScale?: number;
+  pageCount?: number;
+  notes?: string;
+  colorPct?: number;
+}
+
+// One row of the order's payment history, in submission order. Mirrors the
+// ledger's `payment_details` array so a live order and an archived transaction
+// answer "what had been paid by <deadline>?" the same way.
+export interface PaymentTimelineEntry {
+  amount: number;
+  method: string;
+  status: string;
+  referenceNumber: string | null;
+  submittedAt: string;
+  verifiedAt: string | null;
 }
 
 export interface Order {
   id: string;
+  // DB sequence number (identity) and its human-facing ORD-0001 form.
+  orderNumber?: number;
+  displayId?: string;
   customerId: string;
   customerName: string;
   customerEmail: string;
-  status: 'Received' | 'In Queue' | 'Printing' | 'Completed' | 'Released' | 'On Hold' | 'Canceled';
+  status:
+    | 'Awaiting Payment'
+    | 'In Queue'
+    | 'Printing'
+    | 'Completed'
+    | 'Released'
+    | 'Canceled';
   holdReason?: string;
+  cancellationReason?: string;
+  // Payment confirmation/verification deadline (ISO). Cash-on-pickup orders
+  // must be paid at the shop, online orders must be submitted + verified,
+  // before this time or the order is auto-cancelled as expired.
+  paymentDeadline?: string;
+  // Amount the customer reports having paid (online submissions).
+  paymentAmountPaid?: number;
   total: string;
   date: string;
   paperType?: string;
@@ -27,44 +105,69 @@ export interface Order {
   paymentProof?: string;
   paymentReferenceNumber?: string;
   paymentVerified?: boolean;
-  paymentProofUrl?: string;
+  // When the order's verified payment was recorded (ISO), for the receipt.
+  paymentVerifiedAt?: string;
+  // Raw storage path of the upload payment proof (private `payment-proofs`
+  // bucket) — needed to generate a signed URL at read time.
+  proofStoragePath?: string;
+  // DB payments row id for the order's latest payment (used by staff/admin to
+  // mark the customer-submitted row verified/rejected).
+  paymentRowId?: string;
+  // Full payment history (oldest-first). The unclaimed derivation asks this what
+  // had actually been paid by the pickup deadline, so an order is judged on the
+  // money owed then, not on the payment method it chose.
+  paymentTimeline?: PaymentTimelineEntry[];
   fileName?: string;
   pages?: number;
   attachedFiles?: AttachedFile[];
   orientation?: string;
   twoSided?: string;
   pagesPerSheet?: string;
+  margins?: string;
+  scale?: string;
+  customScale?: number;
   colorMode?: string;
   pageRange?: string;
   specificPages?: string;
   notes?: string;
-  addons?: Array<{ name: string; quantity: number; price: number }>;
+  addons?: Array<{
+    name: string;
+    quantity: number;
+    price: number;
+    inventoryItemId?: string;
+  }>;
   costBreakdown?: {
     printingCost: number;
     addonsCost: number;
     total: number;
   };
   orderSource?: 'online' | 'walkin';
+  customerType?: 'printing' | 'photocopy';
+  // Optional manual staff-entered total (overrides automatic pricing, e.g. walk-in photocopy).
+  manualTotal?: number;
   // Down payment fields
   downPaymentRequired?: boolean;
   downPaymentAmount?: number;
   downPaymentVerified?: boolean;
+  // Full payment fields (high-value orders ≥ fullPaymentThreshold — no 50% option)
+  fullPaymentRequired?: boolean;
+  fullPaymentAmount?: number;
+  fullPaymentVerified?: boolean;
+  expectedPaperUsage?: { size: string; sheets: number }[];
+  paperDeductedOnCreate?: boolean;
+  paperConfirmed?: boolean;
+  errorUsage?: { noErrors: boolean; reason?: string; wastedSheets: number };
   // Timestamp tracking fields
   statusUpdatedAt?: string; // ISO string - tracks when status was last changed
   createdAt?: string; // ISO string - tracks when order was created
   lastUpdatedAt?: string; // ISO string - tracks any update to the order
-}
-
-export interface InventoryItem {
-  id: string;
-  name: string;
-  category: string;
-  quantity: number;
-  unit: string;
-  reorderLevel: number;
-  lastUpdated: string;
-  supplier?: string;
-  cost?: number;
+  // Status timeline (oldest-first) from `order_status_history`. Drives the
+  // unclaimed-order derivation (when the order reached Completed / Released),
+  // so it is independent of the order's current status.
+  statusHistory?: Array<{ status: string; oldStatus?: string | null; at: string }>;
+  // True when the history read failed for this fetch — surfaces an "unclaimed
+  // info unavailable" notice instead of implying zero offenses.
+  statusHistoryUnavailable?: boolean;
 }
 
 export interface Notification {
@@ -78,699 +181,574 @@ export interface Notification {
   orderId?: string;
 }
 
-// Mock Orders Data - Comprehensive dataset covering ALL order statuses
-const initialOrders: Order[] = [
-  // RECEIVED status
-  {
-    id: 'ORD-001',
-    customerId: 'customer@test.com',
-    customerName: 'Ethan Laureen',
-    customerEmail: 'customer@test.com',
-    status: 'Received',
-    total: '₱45.00',
-    date: '2026-04-27T08:15:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Short',
-    printType: 'Black & White',
-    copies: 15,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-001.jpg',
-    paymentReferenceNumber: 'GC-20260427-001',
-    paymentVerified: true,
-    fileName: 'document1.pdf',
-    pages: 3,
-    attachedFiles: [
-      { name: 'document1.pdf', size: '1.2 MB', type: 'PDF', uploadedAt: '2026-04-27T08:15:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'no',
-    pagesPerSheet: '1',
-    colorMode: 'bw',
-    pageRange: 'all',
-    notes: 'Please staple pages together',
-    addons: [
-      { name: 'Stapler Wire', quantity: 1, price: 15 }
-    ],
-    costBreakdown: {
-      printingCost: 30.00,
-      addonsCost: 15.00,
-      total: 45.00
-    },
-    orderSource: 'online',
-  },
-  // IN QUEUE status
-  {
-    id: 'ORD-002',
-    customerId: 'test@example.com',
-    customerName: 'Jane Smith',
-    customerEmail: 'test@example.com',
-    status: 'In Queue',
-    total: '₱120.00',
-    date: '2026-04-27T09:30:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Long',
-    printType: 'Colored',
-    copies: 40,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-002.jpg',
-    paymentReferenceNumber: 'GC-20260427-002',
-    paymentVerified: true,
-    fileName: 'presentation.pdf',
-    pages: 12,
-    attachedFiles: [
-      { name: 'presentation.pdf', size: '8.5 MB', type: 'PDF', uploadedAt: '2026-04-27T09:30:00' }
-    ],
-    orientation: 'Landscape',
-    twoSided: 'yes',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'all',
-    notes: 'High-quality print needed for presentation',
-    addons: [
-      { name: 'Plastic Folder (Long)', quantity: 2, price: 15 }
-    ],
-    costBreakdown: {
-      printingCost: 90.00,
-      addonsCost: 30.00,
-      total: 120.00
-    },
-    orderSource: 'online',
-  },
-  {
-    id: 'ORD-003',
-    customerId: 'test2@example.com',
-    customerName: 'Bob Johnson',
-    customerEmail: 'test2@example.com',
-    status: 'In Queue',
-    total: '₱35.00',
-    date: '2026-04-27T10:30:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Short',
-    printType: 'Black & White',
-    copies: 14,
-    paymentMethod: 'Cash',
-    paymentVerified: true,
-    fileName: 'assignment.pdf',
-    pages: 7,
-    attachedFiles: [
-      { name: 'assignment.pdf', size: '890 KB', type: 'PDF', uploadedAt: '2026-04-27T10:30:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'no',
-    pagesPerSheet: '2',
-    colorMode: 'bw',
-    pageRange: 'specific',
-    specificPages: '1-5, 7',
-    notes: '',
-    addons: [],
-    orderSource: 'walkin',
-  },
-  // PRINTING status
-  {
-    id: 'ORD-004',
-    customerId: 'test3@example.com',
-    customerName: 'Alice Brown',
-    customerEmail: 'test3@example.com',
-    status: 'Printing',
-    total: '₱150.00',
-    date: '2026-04-27T07:45:00',
-    paperType: 'Glossy Paper',
-    paperSize: 'Long',
-    printType: 'Colored',
-    copies: 50,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-004.jpg',
-    paymentReferenceNumber: 'GC-20260427-004',
-    paymentVerified: true,
-    fileName: 'portfolio.pdf',
-    pages: 20,
-    attachedFiles: [
-      { name: 'portfolio.pdf', size: '25.6 MB', type: 'PDF', uploadedAt: '2026-04-27T07:45:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'no',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'all',
-    notes: 'Print on glossy paper for professional look',
-    addons: [
-      { name: 'Folder Paper (Long)', quantity: 5, price: 10 },
-      { name: 'Envelope (Large)', quantity: 3, price: 5 }
-    ],
-    costBreakdown: {
-      printingCost: 85.00,
-      addonsCost: 65.00,
-      total: 150.00
-    },
-    orderSource: 'online',
-  },
-  {
-    id: 'ORD-005',
-    customerId: 'test5@example.com',
-    customerName: 'Emma Wilson',
-    customerEmail: 'test5@example.com',
-    status: 'Printing',
-    total: '₱80.00',
-    date: '2026-04-27T08:45:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Short',
-    printType: 'Colored',
-    copies: 20,
-    paymentMethod: 'Cash',
-    paymentVerified: true,
-    fileName: 'flyers.pdf',
-    pages: 8,
-    attachedFiles: [
-      { name: 'flyers.pdf', size: '4.3 MB', type: 'PDF', uploadedAt: '2026-04-27T08:45:00' }
-    ],
-    orientation: 'Landscape',
-    twoSided: 'yes',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'all',
-    notes: 'Urgent - need within 2 hours',
-    addons: [
-      { name: 'Staples', quantity: 20, price: 1 }
-    ],
-    orderSource: 'walkin',
-  },
-  // COMPLETED status
-  {
-    id: 'ORD-006',
-    customerId: 'test4@example.com',
-    customerName: 'Charlie Davis',
-    customerEmail: 'test4@example.com',
-    status: 'Completed',
-    total: '₱90.00',
-    date: '2026-04-26T13:00:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Short',
-    printType: 'Colored',
-    copies: 30,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-006.jpg',
-    paymentReferenceNumber: 'GC-20260426-006',
-    paymentVerified: true,
-    fileName: 'brochure.pdf',
-    pages: 6,
-    attachedFiles: [
-      { name: 'brochure.pdf', size: '5.7 MB', type: 'PDF', uploadedAt: '2026-04-26T13:00:00' }
-    ],
-    orientation: 'Landscape',
-    twoSided: 'no',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'all',
-    notes: 'Fold each brochure in half',
-    addons: [
-      { name: 'Plastic Folder (Short)', quantity: 10, price: 12 }
-    ],
-    orderSource: 'online',
-  },
-  {
-    id: 'ORD-007',
-    customerId: 'test6@example.com',
-    customerName: 'David Martinez',
-    customerEmail: 'test6@example.com',
-    status: 'Completed',
-    total: '₱65.00',
-    date: '2026-04-26T15:45:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Long',
-    printType: 'Black & White',
-    copies: 22,
-    paymentMethod: 'Cash',
-    paymentVerified: true,
-    fileName: 'research.pdf',
-    pages: 18,
-    attachedFiles: [
-      { name: 'research.pdf', size: '6.8 MB', type: 'PDF', uploadedAt: '2026-04-26T15:45:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'yes',
-    pagesPerSheet: '1',
-    colorMode: 'bw',
-    pageRange: 'all',
-    notes: 'Bind with staples on the left side',
-    addons: [
-      { name: 'Staples', quantity: 25, price: 1 },
-      { name: 'Folder Paper (A4)', quantity: 1, price: 10 }
-    ],
-    orderSource: 'walkin',
-  },
-  // RELEASED status
-  {
-    id: 'ORD-008',
-    customerId: 'test7@example.com',
-    customerName: 'Sophia Garcia',
-    customerEmail: 'test7@example.com',
-    status: 'Released',
-    total: '₱55.00',
-    date: '2026-04-25T08:45:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Long',
-    printType: 'Black & White',
-    copies: 25,
-    paymentMethod: 'Cash',
-    paymentVerified: true,
-    fileName: 'report.pdf',
-    pages: 15,
-    attachedFiles: [
-      { name: 'report.pdf', size: '3.2 MB', type: 'PDF', uploadedAt: '2026-04-25T08:45:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'yes',
-    pagesPerSheet: '2',
-    colorMode: 'bw',
-    pageRange: 'all',
-    notes: '',
-    addons: [],
-    orderSource: 'walkin',
-  },
-  {
-    id: 'ORD-009',
-    customerId: 'test8@example.com',
-    customerName: 'Michael Lee',
-    customerEmail: 'test8@example.com',
-    status: 'Released',
-    total: '₱125.00',
-    date: '2026-04-25T11:30:00',
-    paperType: 'Photo Paper',
-    paperSize: 'Short',
-    printType: 'Colored',
-    copies: 35,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-009.jpg',
-    paymentReferenceNumber: 'GC-20260425-009',
-    paymentVerified: true,
-    fileName: 'certificates.pdf',
-    pages: 10,
-    attachedFiles: [
-      { name: 'certificates.pdf', size: '15.2 MB', type: 'PDF', uploadedAt: '2026-04-25T11:30:00' }
-    ],
-    orientation: 'Landscape',
-    twoSided: 'no',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'all',
-    notes: 'Print on high-quality photo paper',
-    addons: [
-      { name: 'Envelope (Medium)', quantity: 35, price: 4 }
-    ],
-    orderSource: 'online',
-  },
-  // ON HOLD status
-  {
-    id: 'ORD-010',
-    customerId: 'test9@example.com',
-    customerName: 'Olivia Taylor',
-    customerEmail: 'test9@example.com',
-    status: 'On Hold',
-    holdReason: 'Waiting for customer to confirm paper size change due to stock availability',
-    total: '₱200.00',
-    date: '2026-04-26T16:20:00',
-    paperType: 'Photo Paper',
-    paperSize: 'Short',
-    printType: 'Colored',
-    copies: 100,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-010.jpg',
-    paymentReferenceNumber: 'GC-20260426-010',
-    paymentVerified: true,
-    fileName: 'marketing.pdf',
-    pages: 25,
-    attachedFiles: [
-      { name: 'marketing.pdf', size: '18.4 MB', type: 'PDF', uploadedAt: '2026-04-26T16:20:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'no',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'specific',
-    specificPages: '1-10, 15-25',
-    notes: 'Customer requested glossy finish for marketing materials',
-    addons: [
-      { name: 'Plastic Folder (Short)', quantity: 50, price: 12 },
-      { name: 'Envelope (Small)', quantity: 100, price: 3 }
-    ],
-    costBreakdown: {
-      printingCost: 125.00,
-      addonsCost: 75.00,
-      total: 200.00
-    },
-    orderSource: 'online',
-  },
-  {
-    id: 'ORD-011',
-    customerId: 'test10@example.com',
-    customerName: 'James Anderson',
-    customerEmail: 'test10@example.com',
-    status: 'On Hold',
-    holdReason: 'Payment verification pending - uploaded receipt is unclear',
-    total: '₱75.00',
-    date: '2026-04-26T14:15:00',
-    paperType: 'Bond Paper',
-    paperSize: 'Long',
-    printType: 'Black & White',
-    copies: 30,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-011.jpg',
-    paymentReferenceNumber: 'GC-20260426-011',
-    paymentVerified: false,
-    fileName: 'thesis.pdf',
-    pages: 20,
-    attachedFiles: [
-      { name: 'thesis.pdf', size: '9.1 MB', type: 'PDF', uploadedAt: '2026-04-26T14:15:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'yes',
-    pagesPerSheet: '1',
-    colorMode: 'bw',
-    pageRange: 'all',
-    notes: 'Thesis document - handle with care',
-    addons: [
-      { name: 'Staples', quantity: 30, price: 1 },
-      { name: 'Folder Paper (Long)', quantity: 2, price: 10 }
-    ],
-    orderSource: 'online',
-  },
-  // CANCELED status
-  {
-    id: 'ORD-012',
-    customerId: 'test11@example.com',
-    customerName: 'Isabella Robinson',
-    customerEmail: 'test11@example.com',
-    status: 'Canceled',
-    total: '₱40.00',
-    date: '2026-04-24',
-    paperType: 'Bond Paper',
-    paperSize: 'Short',
-    printType: 'Black & White',
-    copies: 12,
-    paymentMethod: 'Cash',
-    fileName: 'notes.pdf',
-    pages: 8,
-    attachedFiles: [
-      { name: 'notes.pdf', size: '1.5 MB', type: 'PDF', uploadedAt: '2026-04-24T10:00:00' }
-    ],
-    orientation: 'Portrait',
-    twoSided: 'no',
-    pagesPerSheet: '2',
-    colorMode: 'bw',
-    pageRange: 'all',
-    notes: 'Customer canceled due to change in requirements',
-    addons: [],
-    orderSource: 'online',
-  },
-  {
-    id: 'ORD-013',
-    customerId: 'test12@example.com',
-    customerName: 'Ethan White',
-    customerEmail: 'test12@example.com',
-    status: 'Canceled',
-    total: '₱110.00',
-    date: '2026-04-23',
-    paperType: 'Glossy Paper',
-    paperSize: 'Long',
-    printType: 'Colored',
-    copies: 28,
-    paymentMethod: 'GCash',
-    paymentProof: 'gcash-ref-013.jpg',
-    fileName: 'posters.pdf',
-    pages: 14,
-    attachedFiles: [
-      { name: 'posters.pdf', size: '22.8 MB', type: 'PDF', uploadedAt: '2026-04-23T13:45:00' }
-    ],
-    orientation: 'Landscape',
-    twoSided: 'no',
-    pagesPerSheet: '1',
-    colorMode: 'color',
-    pageRange: 'all',
-    notes: 'Canceled - customer found another print shop',
-    addons: [],
-    orderSource: 'online',
-  },
-];
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
-// Mock Inventory Data
-const initialInventory: InventoryItem[] = [
-  // Paper
-  {
-    id: 'INV-001',
-    name: 'Bond Paper (A4)',
-    category: 'Paper',
-    quantity: 5000,
-    unit: 'sheets',
-    reorderLevel: 1000,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 0.50,
-  },
-  {
-    id: 'INV-002',
-    name: 'Bond Paper (Long)',
-    category: 'Paper',
-    quantity: 650, // Low stock - below reorder level of 800
-    unit: 'sheets',
-    reorderLevel: 800,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 0.75,
-  },
-  {
-    id: 'INV-003',
-    name: 'Bond Paper (Short)',
-    category: 'Paper',
-    quantity: 450, // Critical stock - 50% below reorder level of 1000
-    unit: 'sheets',
-    reorderLevel: 1000,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 0.60,
-  },
-  // Ink Cartridges
-  {
-    id: 'INV-004',
-    name: 'BK - 65 mL (Black Ink Cartridge)',
-    category: 'Ink',
-    quantity: 25,
-    unit: 'units',
-    reorderLevel: 10,
-    lastUpdated: '2026-04-27',
-    supplier: 'Printer Supplies Ltd.',
-    cost: 450.00,
-  },
-  {
-    id: 'INV-005',
-    name: 'C - 65 mL (Cyan Ink Cartridge)',
-    category: 'Ink',
-    quantity: 18,
-    unit: 'units',
-    reorderLevel: 8,
-    lastUpdated: '2026-04-27',
-    supplier: 'Printer Supplies Ltd.',
-    cost: 420.00,
-  },
-  {
-    id: 'INV-006',
-    name: 'M - 65 mL (Magenta Ink Cartridge)',
-    category: 'Ink',
-    quantity: 20,
-    unit: 'units',
-    reorderLevel: 8,
-    lastUpdated: '2026-04-27',
-    supplier: 'Printer Supplies Ltd.',
-    cost: 420.00,
-  },
-  {
-    id: 'INV-007',
-    name: 'Y - 65 mL (Yellow Ink Cartridge)',
-    category: 'Ink',
-    quantity: 22,
-    unit: 'units',
-    reorderLevel: 8,
-    lastUpdated: '2026-04-27',
-    supplier: 'Printer Supplies Ltd.',
-    cost: 420.00,
-  },
-  // Add-ons
-  {
-    id: 'INV-008',
-    name: 'Staples',
-    category: 'Add-ons',
-    quantity: 150,
-    unit: 'boxes',
-    reorderLevel: 30,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 15.00,
-  },
-  // Plastic Folders
-  {
-    id: 'INV-009',
-    name: 'Plastic Folder (Long)',
-    category: 'Add-ons',
-    quantity: 200,
-    unit: 'pieces',
-    reorderLevel: 50,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 8.00,
-  },
-  {
-    id: 'INV-010',
-    name: 'Plastic Folder (Short)',
-    category: 'Add-ons',
-    quantity: 180,
-    unit: 'pieces',
-    reorderLevel: 50,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 7.00,
-  },
-  // Paper Folders
-  {
-    id: 'INV-011',
-    name: 'Folder (Paper) - A4',
-    category: 'Add-ons',
-    quantity: 250,
-    unit: 'pieces',
-    reorderLevel: 60,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 5.00,
-  },
-  {
-    id: 'INV-012',
-    name: 'Folder (Paper) - Long',
-    category: 'Add-ons',
-    quantity: 220,
-    unit: 'pieces',
-    reorderLevel: 60,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 5.50,
-  },
-  {
-    id: 'INV-013',
-    name: 'Folder (Paper) - Short',
-    category: 'Add-ons',
-    quantity: 240,
-    unit: 'pieces',
-    reorderLevel: 60,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 4.50,
-  },
-  // Envelopes
-  {
-    id: 'INV-014',
-    name: 'Envelope - Small (4x6 in)',
-    category: 'Add-ons',
-    quantity: 300,
-    unit: 'pieces',
-    reorderLevel: 80,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 2.00,
-  },
-  {
-    id: 'INV-015',
-    name: 'Envelope - Medium (6x9 in)',
-    category: 'Add-ons',
-    quantity: 280,
-    unit: 'pieces',
-    reorderLevel: 70,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 3.00,
-  },
-  {
-    id: 'INV-016',
-    name: 'Envelope - Large (9x12 in)',
-    category: 'Add-ons',
-    quantity: 260,
-    unit: 'pieces',
-    reorderLevel: 60,
-    lastUpdated: '2026-04-27',
-    supplier: 'Office Supplies Co.',
-    cost: 4.00,
-  },
-];
+const money = (n: number): string => `₱${n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
-// In-memory store with event listeners
+const SIZE_KEY_MAP: Record<string, string> = {
+  a4: 'A4',
+  short: 'Short',
+  long: 'Long',
+  folio: 'Folio',
+  legal: 'Legal',
+  a3: 'A3',
+};
+
+const fileSizeLabel = (bytes: number | null): string => {
+  if (bytes == null) return '0 MB';
+  const mb = bytes / 1024 / 1024;
+  return mb >= 0.01 ? `${mb.toFixed(2)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+};
+
+const fileTypeLabel = (mime: string | null, fallback: string | null): string => {
+  const src = mime || '';
+  if (src.includes('pdf')) return 'PDF';
+  if (src.includes('word') || src.includes('document')) return 'Document';
+  if (src.includes('powerpoint') || src.includes('presentation')) return 'PowerPoint';
+  if (src.includes('excel') || src.includes('spreadsheet')) return 'Excel';
+  if (src.includes('image')) return 'Image';
+  return fallback || 'Document';
+};
+
+function toAttachedFile(f: OrderFileDto): AttachedFile {
+  return {
+    name: f.originalName,
+    size: fileSizeLabel(f.sizeBytes),
+    type: fileTypeLabel(f.mimeType, f.printType),
+    url: resolveStorageUrl(BUCKETS.orderFiles, f.storagePath) || undefined,
+    storagePath: f.storagePath || undefined,
+    uploadedAt: f.createdAt.toISOString(),
+    printType: f.printType || undefined,
+    contentType: f.contentType || undefined,
+    photoSize: f.photoSize || undefined,
+    photoQuantity: f.photoQuantity ?? undefined,
+    notes: f.notes || undefined,
+    paperSize: f.paperSize || undefined,
+    orientation: f.orientation || undefined,
+    copies: f.copies,
+    twoSided: f.twoSided || undefined,
+    pagesPerSheet: f.pagesPerSheet || undefined,
+    colorMode: f.colorMode || undefined,
+    pageRange: f.pageRange || undefined,
+    specificPages: f.specificPages || undefined,
+    margins: f.margins || undefined,
+    scale: f.scale || undefined,
+    customScale: f.customScale ?? undefined,
+    pageCount: f.pageCount ?? undefined,
+  };
+}
+
+// Map a DB OrderDto back into the legacy app Order shape that all consumers
+// read. Payment-derived fields (verified flag, reference, proof, method) come
+// from the order's payments rows.
+export function orderDtoToApp(dto: OrderDto): Order {
+  const verifiedPayments = dto.payments.filter((p) => p.status === 'verified').sort((a, b) => b.verifiedAt?.getTime()! - a.verifiedAt?.getTime()! || b.submittedAt.getTime() - a.submittedAt.getTime());
+  const latestPayment = dto.payments
+    .slice()
+    .sort((a, b) => b.submittedAt.getTime() - a.submittedAt.getTime())[0];
+  const vp = verifiedPayments[0];
+  const firstFile = dto.files[0];
+  const pages = dto.files.reduce((sum, f) => sum + (f.pageCount ?? 0) * f.copies, 0);
+  const total = dto.manualTotal ?? dto.total;
+
+  return {
+    id: dto.id,
+    orderNumber: dto.orderNumber,
+    displayId: formatOrderNumber(dto.orderNumber),
+    customerId: dto.customerId ?? dto.customerEmail,
+    customerName: dto.customerName,
+    customerEmail: dto.customerEmail,
+    status: dto.status,
+    holdReason: dto.holdReason ?? undefined,
+    cancellationReason: dto.cancellationReason ?? undefined,
+    paymentDeadline: dto.paymentDeadline?.toISOString(),
+    paymentAmountPaid: dto.paymentAmountPaid,
+    total: money(total),
+    date: dto.createdAt.toISOString(),
+    paperType: firstFile?.printType || undefined,
+    paperSize: firstFile?.paperSize ? (SIZE_KEY_MAP[firstFile.paperSize] ?? firstFile.paperSize) : undefined,
+    printType: dto.files.some((f) => f.colorMode && f.colorMode !== 'bw')
+      ? 'Colored'
+      : 'Black & White',
+    copies: firstFile?.copies || undefined,
+    paymentMethod:
+      vp?.methodName ??
+      latestPayment?.methodName ??
+      (dto.orderSource === 'walkin' ? 'Cash' :
+       // Customer cash-on-pickup orders have no payment row; the holdReason is
+       // the tell ("Cash on Pickup: …").
+       dto.holdReason?.includes('Cash on Pickup') ? 'Cash' : undefined),
+    paymentProof: undefined,
+    paymentRowId: latestPayment?.id,
+    paymentTimeline: dto.payments
+      .slice()
+      .sort((a, b) => a.submittedAt.getTime() - b.submittedAt.getTime() || a.id.localeCompare(b.id))
+      .map((p) => ({
+        amount: p.amount,
+        method: p.methodName,
+        status: p.status,
+        referenceNumber: p.referenceNumber,
+        submittedAt: p.submittedAt.toISOString(),
+        verifiedAt: p.verifiedAt ? p.verifiedAt.toISOString() : null,
+      })),
+    // The reference + proof belong to the customer's LATEST submission, not only
+    // to a verified row — staff review the pending payment's proof/reference, and
+    // the invoice, receipt label and expiry guard all treat
+    // "reference present but paymentVerified false" as pending-verification.
+    paymentReferenceNumber: latestPayment?.referenceNumber ?? undefined,
+    paymentVerified: hasVerifiedPayment(dto.payments.map((p) => p.status)),
+    paymentVerifiedAt: vp?.verifiedAt?.toISOString(),
+    proofStoragePath: latestPayment?.proofStoragePath ?? undefined,
+    fileName: firstFile?.originalName,
+    pages: pages || firstFile?.pageCount || undefined,
+    attachedFiles: dto.files.map(toAttachedFile),
+    orientation: firstFile?.orientation || undefined,
+    twoSided: firstFile?.twoSided || undefined,
+    pagesPerSheet: firstFile?.pagesPerSheet || undefined,
+    margins: firstFile?.margins || undefined,
+    scale: firstFile?.scale || undefined,
+    customScale: firstFile?.customScale ?? undefined,
+    colorMode: firstFile?.colorMode || undefined,
+    pageRange: firstFile?.pageRange || undefined,
+    specificPages: firstFile?.specificPages || undefined,
+    notes: dto.notes ?? undefined,
+    addons: dto.addons.map((a) => ({ name: a.name, quantity: a.quantity, price: a.unitPrice })),
+    costBreakdown: dto.costBreakdown ?? undefined,
+    orderSource: dto.orderSource,
+    customerType: (dto.customerType as Order['customerType']) || undefined,
+    manualTotal: dto.manualTotal ?? undefined,
+    downPaymentRequired: dto.downPaymentRequired,
+    downPaymentAmount: dto.downPaymentAmount ?? undefined,
+    downPaymentVerified: dto.downPaymentVerified,
+    fullPaymentRequired: dto.fullPaymentRequired,
+    fullPaymentAmount: dto.fullPaymentAmount ?? undefined,
+    fullPaymentVerified: dto.fullPaymentVerified,
+    expectedPaperUsage: dto.expectedPaperUsage ?? undefined,
+    paperDeductedOnCreate: dto.paperDeductedOnCreate,
+    paperConfirmed: dto.paperConfirmed,
+    errorUsage: dto.errorUsage ?? undefined,
+    statusUpdatedAt: dto.statusUpdatedAt.toISOString(),
+    createdAt: dto.createdAt.toISOString(),
+    lastUpdatedAt: dto.updatedAt.toISOString(),
+    statusHistory: (dto.statusHistory ?? []).map((h) => ({
+      status: h.newStatus,
+      oldStatus: h.oldStatus,
+      at: h.createdAt.toISOString(),
+    })),
+    statusHistoryUnavailable: dto.statusHistoryUnavailable,
+  };
+}
+
+// Input accepted by addOrder — deliberately loose: it accepts BOTH the
+// customer-flow app Order (minus its pre-minted display id) and the walk-in
+// ordersStore shape (lowercase `customer`, legacy lowercase status).
+export type OrderInput = Partial<Order> &
+  Pick<Order, 'notes'> & {
+    id?: string;
+    customer?: string;
+    submittedAt?: Date;
+    // Real Supabase auth uid of whoever is creating the order (customer for the
+    // checkout flow, staff/admin for walk-ins). Used for status-history actor.
+    actorId?: string | null;
+    status?:
+      | Order['status']
+      | 'inQueue'
+      | 'printing'
+      | 'completed'
+      | 'released'
+      | 'canceled'
+      | 'awaitingPayment';
+  };
+
+export type OrderUploadProgress = {
+  // 1-based index of the file currently uploading, within the total files that
+  // actually carry bytes (files without a File object are skipped).
+  fileIndex: number;
+  fileCount: number;
+  fileName: string;
+  percent: number; // 0-100 for the current file
+};
+
+function parseMoney(v: string | number | undefined, fallback: number): number {
+  if (typeof v === 'number') return isNaN(v) ? fallback : v;
+  if (v == null) return fallback;
+  const n = parseFloat(String(v).replace(/[₱,]/g, ''));
+  return isNaN(n) ? fallback : n;
+}
+
+// ─── Store ──────────────────────────────────────────────────────────────────
+
 class DataStore {
-  private orders: Order[] = [...initialOrders];
-  private inventory: InventoryItem[] = [...initialInventory];
+  private orders: Order[] = [];
   private listeners: Set<() => void> = new Set();
+  private initialized = false;
+  private lastRefreshAt = 0;
 
   constructor() {
-    // Initialize order counter from existing orders
-    this.initializeOrderCounter();
+    this.hydrate();
+    this.initialized = true;
+
+    subscribeOrderChanges(() => {
+      void this.refresh();
+    });
+  }
+
+  private notify() {
+    this.listeners.forEach((l) => l());
+  }
+
+  // Full re-read from Supabase (used on initial load + realtime events). A
+  // failed fetch keeps the previous cache so transient RLS/network errors do
+  // not blank the UI.
+  private async refresh(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastRefreshAt < 400) return; // cheap re-entry guard
+    this.lastRefreshAt = now;
+    try {
+      const dtos = await fetchOrders();
+      this.orders = dtos.map(orderDtoToApp);
+      this.notify();
+    } catch (err) {
+      console.warn('[dataStore] order refresh failed (stale cache retained)', err);
+    }
+  }
+
+  async hydrate(): Promise<void> {
+    await authReady;
+    try {
+      const dtos = await fetchOrders();
+      this.orders = dtos.map(orderDtoToApp);
+    } catch (err) {
+      console.warn('[dataStore] initial order hydrate failed', err);
+    }
+    this.notify();
+  }
+
+  // Public force-refetch entry (used by storeSync after auth settles); failures
+  // keep the current snapshot so a transient RLS/network error never blanks UI.
+  refreshFromBackend(): Promise<void> {
+    return this.hydrate();
   }
 
   subscribe(listener: () => void) {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
-  private notify() {
-    this.listeners.forEach(listener => listener());
-  }
-
-  // Order methods
+  // Order read methods (sync — these power every dashboard/list)
   getOrders(): Order[] {
     return [...this.orders];
   }
 
   getOrdersByCustomer(customerEmail: string): Order[] {
-    return this.orders.filter(order => order.customerEmail === customerEmail);
+    return this.orders.filter((o) => o.customerEmail === customerEmail);
   }
 
   getOrderById(id: string): Order | undefined {
-    return this.orders.find(order => order.id === id);
+    return this.orders.find((o) => o.id === id);
   }
 
-  addOrder(order: Order) {
-    // Automatically add timestamp when creating a new order
-    const now = new Date().toISOString();
-    const orderWithTimestamps = {
-      ...order,
-      createdAt: order.createdAt || now,
-      statusUpdatedAt: order.statusUpdatedAt || now,
-      lastUpdatedAt: now
-    };
-    this.orders.unshift(orderWithTimestamps);
-    this.notify();
-  }
-
-  updateOrder(id: string, updates: Partial<Order>) {
-    const index = this.orders.findIndex(order => order.id === id);
-    if (index !== -1) {
-      const now = new Date().toISOString();
-      const previousStatus = this.orders[index].status;
-
-      // Automatically update timestamps
-      const timestampedUpdates = {
-        ...updates,
-        lastUpdatedAt: now,
-        // Update statusUpdatedAt only if status is actually changing
-        ...(updates.status && updates.status !== previousStatus
-          ? { statusUpdatedAt: now }
-          : {})
-      };
-
-      this.orders[index] = { ...this.orders[index], ...timestampedUpdates };
-      this.notify();
+  async getOrderByIdAsync(id: string): Promise<Order | undefined> {
+    const cached = this.orders.find((o) => o.id === id);
+    if (cached) return cached;
+    try {
+      const dto = await fetchOrderById(id);
+      if (!dto) return undefined;
+      const app = orderDtoToApp(dto);
+      this.orders = [app, ...this.orders];
+      return app;
+    } catch (err) {
+      console.warn('[dataStore] fetch by id failed', err);
+      return undefined;
     }
   }
 
-  updateOrderStatus(id: string, status: Order['status'], holdReason?: string) {
-    this.updateOrder(id, { status, holdReason });
+  // Create an order in Supabase (plus its files/addons/cost breakdown/history),
+  // then adopt the result locally. Returns the created app Order — its `id` is
+  // the DB uuid and `displayId` is the ORD-0001 form. The input's pre-minted
+  // display `id` (legacy counter) is ignored.
+  async addOrder(input: OrderInput, onProgress?: (p: OrderUploadProgress) => void): Promise<Order> {
+    const oversizedFile = input.attachedFiles?.find(
+      (file) => file.file && file.file.size > MAX_ORDER_FILE_SIZE_BYTES,
+    );
+    if (oversizedFile) {
+      throw new Error(`Order file size limit exceeded: ${oversizedFile.name}`);
+    }
+
+    const total = parseMoney(input.total, 0);
+    const isWalkin = input.orderSource === 'walkin';
+
+    // FINALIZED RULE — once a customer has enough DERIVED unclaimed Cash-on-
+    // Pickup orders, Cash on Pickup is blocked for their future orders. The
+    // count comes from the real order + status-history timeline (never a local
+    // ledger), and an unconfigured closing time derives nothing, so this guard
+    // only fires on a real, computed restriction. An offense the admin has
+    // EXCUSED stops counting, and an INACTIVE stored restriction is early
+    // forgiveness that re-enables Cash on Pickup regardless of the count.
+    // Enforced HERE at the single order-submission chokepoint (the same path
+    // every print request flows through), NOT only in checkout, so a
+    // manipulated selection is still rejected before any row or file is
+    // written. Walk-in sales are exempt.
+    if (!isWalkin && input.paymentMethod === 'Cash') {
+      const customerKey = input.customerEmail ?? input.actorId ?? null;
+      const closingTime = landingContentStore.getContent().shopClosingTime;
+      const summary = findCustomerSummary(
+        toUnclaimedOrderLikes(this.orders),
+        customerKey,
+        closingTime,
+      );
+      // Excused offenses stop counting before we enforce anything.
+      const effectiveCount = (summary?.records ?? []).filter(
+        (r) => restrictionsStore.getOverride(r.orderId)?.decision !== 'excused',
+      ).length;
+      // The stored restriction, when present, is the admin's word on whether
+      // this customer is currently restricted — it overrides the bare count.
+      const policy = effectivePolicy(
+        effectiveCount,
+        restrictionsStore.getRestriction(customerKey),
+      );
+      if (policy.cashOnPickupDisabled) {
+        throw new Error(CASH_ON_PICKUP_BLOCKED_MESSAGE);
+      }
+    }
+
+    // Upload attached file bytes to Storage BEFORE any DB write so a storage
+    // failure (bucket missing, RLS, offline) blocks placement cleanly with no
+    // orphaned order row. If any file upload fails, best-effort remove whatever
+    // was already uploaded and rethrow so the caller aborts before touching the DB.
+    const files = input.attachedFiles ?? [];
+    const uploadFolder = `${input.actorId ?? 'anonymous'}/orders`;
+    const storagePaths: (string | null)[] = [];
+
+    // Pre-count the files that actually carry bytes so the progress callback can
+    // report "file 2 of 3" accurately (files without a File object are skipped).
+    const uploadable = files.filter((f) => Boolean(f.file));
+    let uploadIndex = 0;
+
+    for (const f of files) {
+      if (!f.file) {
+        storagePaths.push(null);
+        continue;
+      }
+      uploadIndex += 1;
+      const fileIndex = uploadIndex;
+      const fileCount = uploadable.length;
+      try {
+        const path = await uploadObjectAndGetPath({
+          bucket: BUCKETS.orderFiles,
+          folder: uploadFolder,
+          file: f.file,
+          fileName: f.name,
+          contentType: f.mimeType || f.file.type,
+          onProgress: onProgress
+            ? (loaded, total) => {
+                onProgress({
+                  fileIndex,
+                  fileCount,
+                  fileName: f.name,
+                  percent: total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0,
+                });
+              }
+            : undefined,
+        });
+        storagePaths.push(path);
+      } catch (err) {
+        await removeObjectsIfPresent(BUCKETS.orderFiles, storagePaths);
+        throw err;
+      }
+    }
+
+    // Build the server payload from the file metadata + attached bytes. The RPC
+    // recomputes the price from the matrix, derives the payment tier and status
+    // from the server-side thresholds, mints the deadline from the server clock
+    // and writes the order + files + addons + breakdown + history atomically.
+    const filePayload = files.map((f, i) => ({
+      storagePath: storagePaths[i],
+      originalName: f.name,
+      mimeType: f.mimeType ?? f.file?.type ?? null,
+      sizeBytes: f.sizeBytes ?? f.file?.size ?? null,
+      pageCount: f.pageCount ?? null,
+      printType: f.printType ?? null,
+      contentType: f.contentType ?? null,
+      paperSize: f.paperSize ?? null,
+      copies: f.copies ?? 1,
+      colorMode: f.colorMode ?? null,
+      pageRange: f.pageRange ?? null,
+      specificPages: f.specificPages ?? null,
+      pagesPerSheet: f.pagesPerSheet ?? null,
+      orientation: f.orientation ?? null,
+      twoSided: f.twoSided ?? null,
+      margins: f.margins ?? null,
+      scale: f.scale ?? null,
+      customScale: f.customScale ?? null,
+      photoSize: f.photoSize ?? null,
+      photoQuantity: f.photoQuantity ?? null,
+      notes: f.notes ?? null,
+      colorPct: f.colorPct ?? 0,
+    }));
+
+    const addonPayload = (input.addons ?? []).map((a) => ({
+      name: a.name,
+      quantity: a.quantity,
+      unitPrice: a.price,
+      inventoryItemId: a.inventoryItemId ?? null,
+    }));
+
+    const payload: Record<string, unknown> = {
+      customerName: input.customerName ?? input.customer ?? 'Customer',
+      customerEmail: input.customerEmail ?? null,
+      customerType: input.customerType ?? null,
+      notes: input.notes ?? '',
+      paymentMethod: input.paymentMethod ?? 'Cash',
+      files: filePayload,
+      addons: addonPayload,
+    };
+
+    if (isWalkin) {
+      payload.manualTotal = input.manualTotal ?? null;
+      if (input.expectedPaperUsage) payload.expectedPaperUsage = input.expectedPaperUsage;
+      if (input.paperSize) payload.paperSize = input.paperSize;
+      if (input.copies != null) payload.copies = input.copies;
+    }
+
+    let id: string;
+    try {
+      ({ id } = isWalkin
+        ? await createWalkInOrderRpc(payload)
+        : await createCustomerOrderRpc(payload));
+    } catch (err) {
+      // The RPC failed — remove the files we just uploaded so storage never
+      // holds orphans for an order that doesn't exist.
+      await removeObjectsIfPresent(BUCKETS.orderFiles, storagePaths);
+      throw err;
+    }
+
+    if (isWalkin) {
+      // The RPC already wrote the walk_in_transactions companion row. Only the
+      // audit entry is a client concern; it is best-effort and can never reverse
+      // the placed order.
+      const walkInCustomerName = input.customer ?? input.customerName ?? 'Walk-in Customer';
+      const walkInTotal = input.manualTotal ?? input.costBreakdown?.total ?? total;
+      auditLogStore.record({
+        module: 'Walk-in',
+        action: 'Created',
+        reference: `${walkInCustomerName} — Walk-in`,
+        entityType: 'Order',
+        entityId: id,
+        title: 'Walk-in Transaction Placed',
+        description: `A walk-in ${input.customerType === 'photocopy' ? 'photocopy' : 'printing'} transaction for ${walkInCustomerName} was placed. Total to collect: ₱${String(walkInTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}.`,
+        changes: walkInTotal > 0
+          ? [{ field: 'Total', previous: '—', next: `₱${String(walkInTotal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }))}` }]
+          : [],
+      });
+    }
+
+    const dto = await fetchOrderById(id);
+    if (!dto) throw new Error('Order was created but could not be reloaded.');
+    const app = orderDtoToApp(dto);
+    this.orders = [app, ...this.orders];
+    this.notify();
+    return app;
   }
 
-  deleteOrder(id: string) {
-    this.orders = this.orders.filter(order => order.id !== id);
+  // DB-backed partial update. Persists, then mutates cache only on success.
+  async updateOrder(id: string, updates: Partial<Order>): Promise<Order | undefined> {
+    const current = this.orders.find((o) => o.id === id);
+
+    const patch: Parameters<typeof dbUpdateOrder>[1] = {};
+    if ('status' in updates && updates.status) patch.status = updates.status;
+    const statusUpdatedAt = updates.statusUpdatedAt
+      ? new Date(updates.statusUpdatedAt)
+      : updates.status && updates.status !== current?.status
+        ? new Date()
+        : undefined;
+    if (statusUpdatedAt) patch.statusUpdatedAt = statusUpdatedAt;
+    if ('holdReason' in updates) patch.holdReason = updates.holdReason ?? null;
+    if ('cancellationReason' in updates) patch.cancellationReason = updates.cancellationReason ?? null;
+    if ('paymentDeadline' in updates)
+      patch.paymentDeadline = updates.paymentDeadline ? new Date(updates.paymentDeadline) : null;
+    if ('paymentAmountPaid' in updates && updates.paymentAmountPaid != null)
+      patch.paymentAmountPaid = updates.paymentAmountPaid;
+    if ('downPaymentRequired' in updates) patch.downPaymentRequired = updates.downPaymentRequired;
+    if ('downPaymentAmount' in updates) patch.downPaymentAmount = updates.downPaymentAmount ?? null;
+    if ('downPaymentVerified' in updates) patch.downPaymentVerified = updates.downPaymentVerified;
+    if ('fullPaymentRequired' in updates) patch.fullPaymentRequired = updates.fullPaymentRequired;
+    if ('fullPaymentAmount' in updates) patch.fullPaymentAmount = updates.fullPaymentAmount ?? null;
+    if ('fullPaymentVerified' in updates) patch.fullPaymentVerified = updates.fullPaymentVerified;
+    if ('expectedPaperUsage' in updates) patch.expectedPaperUsage = updates.expectedPaperUsage ?? null;
+    if ('paperDeductedOnCreate' in updates) patch.paperDeductedOnCreate = updates.paperDeductedOnCreate;
+    if ('paperConfirmed' in updates) patch.paperConfirmed = updates.paperConfirmed;
+    if ('errorUsage' in updates) patch.errorUsage = updates.errorUsage ?? null;
+    if ('notes' in updates) patch.notes = updates.notes ?? null;
+    if ('manualTotal' in updates) patch.manualTotal = updates.manualTotal ?? null;
+    if ('customerName' in updates) patch.customerName = updates.customerName;
+    if ('customerEmail' in updates) patch.customerEmail = updates.customerEmail;
+
+    const oldStatus = current?.status ?? null;
+    const newStatus = patch.status ?? oldStatus;
+
+    // The breakdown goes first on purpose: it is the figure the receipt and
+    // Order Details read, and it is the write whose table policy is least
+    // certain. If the server refuses it, nothing was saved and the failure
+    // message stays true — whereas writing manual_total first would leave a
+    // repriced order whose stored breakdown still holds the old total.
+    if ('costBreakdown' in updates && updates.costBreakdown) {
+      await upsertCostBreakdown(id, {
+        printingCost: updates.costBreakdown.printingCost,
+        addonsCost: updates.costBreakdown.addonsCost,
+        total: updates.costBreakdown.total,
+      });
+    }
+
+    await dbUpdateOrder(id, patch);
+
+    if (patch.status && newStatus && newStatus !== oldStatus) {
+      await insertStatusHistory(id, {
+        oldStatus,
+        newStatus,
+        reason: patch.cancellationReason ?? null,
+        changedBy: null,
+      }).catch((err) => console.warn('[dataStore] status history write failed', err));
+    }
+
+    // Re-read the fresh row so order_number + payments stay consistent.
+    // A failed re-read (e.g. mobile network/RLS) must NOT surface as a
+    // save failure — the write already succeeded above.
+    try {
+      const fresh = await fetchOrderById(id);
+      if (fresh) {
+        const app = orderDtoToApp(fresh);
+        this.orders = [app, ...this.orders.filter((o) => o.id !== id)];
+        this.notify();
+        return app;
+      }
+    } catch (err) {
+      console.warn('[dataStore] post-update re-read failed (write succeeded)', err);
+    }
+
+    // Fallback: mirror the patched order locally so the UI reflects the change.
+    const fallback = current
+      ? {
+          ...current,
+          ...updates,
+          statusUpdatedAt: statusUpdatedAt?.toISOString() ?? current.statusUpdatedAt,
+        }
+      : undefined;
+    if (fallback) {
+      this.orders = [fallback as Order, ...this.orders.filter((o) => o.id !== id)];
+      this.notify();
+    }
+    return fallback;
+  }
+
+  updateOrderStatus(id: string, status: Order['status'], holdReason?: string) {
+    return this.updateOrder(id, { status, holdReason });
+  }
+
+  async deleteOrder(id: string): Promise<void> {
+    this.orders = this.orders.filter((o) => o.id !== id);
     this.notify();
   }
 
@@ -779,150 +757,37 @@ class DataStore {
       ? this.getOrdersByCustomer(customerEmail)
       : this.orders;
 
-    const received  = orders.filter(o => o.status === 'Received').length;
-    const inQueue   = orders.filter(o => o.status === 'In Queue').length;
-    const printing  = orders.filter(o => o.status === 'Printing').length;
-    const completed = orders.filter(o => o.status === 'Completed').length;
-    const released  = orders.filter(o => o.status === 'Released').length;
-    const onHold    = orders.filter(o => o.status === 'On Hold').length;
+    const awaitingPayment = orders.filter((o) => o.status === 'Awaiting Payment').length;
+    const inQueue = orders.filter((o) => o.status === 'In Queue').length;
+    const printing = orders.filter((o) => o.status === 'Printing').length;
+    const completed = orders.filter((o) => o.status === 'Completed').length;
+    const released = orders.filter((o) => o.status === 'Released').length;
+    const canceled = orders.filter((o) => o.status === 'Canceled').length;
 
-    // "In Progress" = all orders actively being handled (received + queued + printing)
-    const inProgress = received + inQueue + printing;
+    // "In Progress" = orders actively being printed (queued + printing)
+    const inProgress = inQueue + printing;
     // "All Completed" = done + picked up
     const allCompleted = completed + released;
-    // "Active" = all orders not yet finished/picked up (includes onHold)
-    const allActive = inProgress + onHold;
+    // "Active" = not yet finished or picked up (includes awaiting payment)
+    const allActive = inQueue + printing + awaitingPayment;
     // "Finished" = completed + released (alias)
     const allFinished = allCompleted;
-    // Total = onHold + inProgress + allCompleted (no canceled) — always matches sum of status cards
-    const total = onHold + inProgress + allCompleted;
+    // Total = awaitingPayment + inProgress + allCompleted (no canceled)
+    const total = awaitingPayment + inProgress + allCompleted;
 
     return {
-      total,        // = onHold + inProgress + allCompleted (consistent with dashboard cards)
-      received,
+      total,
+      awaitingPayment,
       inQueue,
       printing,
       completed,
       released,
-      onHold,
-      inProgress,   // received + inQueue + printing
-      allCompleted, // completed + released
-      // Legacy aliases kept for backward compatibility
-      allActive,    // inProgress + onHold
-      allFinished,  // completed + released
+      canceled,
+      inProgress,
+      allCompleted,
+      allActive,
+      allFinished,
     };
-  }
-
-  // Inventory methods
-  getInventory(): InventoryItem[] {
-    return [...this.inventory];
-  }
-
-  getInventoryById(id: string): InventoryItem | undefined {
-    return this.inventory.find(item => item.id === id);
-  }
-
-  addInventoryItem(item: InventoryItem) {
-    this.inventory.push(item);
-    this.notify();
-  }
-
-  updateInventoryItem(id: string, updates: Partial<InventoryItem>) {
-    const index = this.inventory.findIndex(item => item.id === id);
-    if (index !== -1) {
-      this.inventory[index] = {
-        ...this.inventory[index],
-        ...updates,
-        lastUpdated: new Date().toISOString().split('T')[0],
-      };
-      this.notify();
-    }
-  }
-
-  deleteInventoryItem(id: string) {
-    this.inventory = this.inventory.filter(item => item.id !== id);
-    this.notify();
-  }
-
-  getLowStockItems(): InventoryItem[] {
-    return this.inventory.filter(item => item.quantity <= item.reorderLevel);
-  }
-
-  // Get stock status for an item
-  getStockStatus(item: InventoryItem): 'in-stock' | 'low-stock' | 'critical' {
-    const percentageOfReorder = item.quantity / item.reorderLevel;
-
-    if (item.quantity <= item.reorderLevel * 0.5) {
-      return 'critical'; // 50% or less of reorder level
-    } else if (item.quantity <= item.reorderLevel) {
-      return 'low-stock'; // At or below reorder level
-    }
-    return 'in-stock'; // Above reorder level
-  }
-
-  // Get stock status label
-  getStockStatusLabel(item: InventoryItem): string {
-    const status = this.getStockStatus(item);
-    if (status === 'critical') return 'Critical Stock';
-    if (status === 'low-stock') return 'Low Stock';
-    return 'In Stock';
-  }
-
-  // Get stock status color class
-  getStockStatusColor(item: InventoryItem): string {
-    const status = this.getStockStatus(item);
-    if (status === 'critical') return 'bg-red-100 text-red-800 border-red-300';
-    if (status === 'low-stock') return 'bg-amber-100 text-amber-800 border-amber-300';
-    return 'bg-green-100 text-green-800 border-green-300';
-  }
-
-  // Get available paper sizes from inventory (for customer order form)
-  getAvailablePaperSizes(): Array<{ id: string; name: string; displayName: string; inStock: boolean }> {
-    const paperItems = this.inventory.filter(item => item.category === 'Paper' && !item.archived);
-    return paperItems.map(item => {
-      // Extract size from name format: "Bond Paper (A4)" -> "A4"
-      const match = item.name.match(/\(([^)]+)\)/);
-      const size = match ? match[1] : item.name;
-      return {
-        id: item.id,
-        name: size.toLowerCase().replace(/\s+/g, ''),
-        displayName: size,
-        inStock: item.quantity > 0
-      };
-    });
-  }
-
-  // Get available add-ons from inventory (for customer order form)
-  getAvailableAddons(): Array<{
-    id: string;
-    name: string;
-    price: number;
-    inStock: boolean;
-    unit: string;
-    category: string;
-    description: string;
-  }> {
-    const addonItems = this.inventory.filter(item => item.category === 'Add-ons' && !item.archived);
-    return addonItems.map(item => ({
-      id: item.id,
-      name: item.name,
-      price: item.cost || 0,
-      inStock: item.quantity > 0,
-      unit: item.unit || 'piece',
-      category: 'supplies',
-      description: `${item.name} for printing needs`
-    }));
-  }
-
-  // Generate next sequential order ID using centralized counter
-  getNextOrderId(): string {
-    return orderCounter.getNextOrderId();
-  }
-
-  // Initialize the order counter from existing orders (call once on app start)
-  initializeOrderCounter(): void {
-    const orderIds = this.orders.map(order => order.id);
-    orderCounter.initializeFromOrders(orderIds);
   }
 }
 

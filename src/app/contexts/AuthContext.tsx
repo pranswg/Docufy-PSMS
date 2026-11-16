@@ -1,27 +1,96 @@
 import React, { useState, createContext, useContext, useEffect } from 'react';
 import { toast } from 'sonner';
+import { usePopup } from './PopupContext';
 import { sessionManager } from '../utils/sessionManager';
+import { supabase } from '../../lib/supabaseClient';
+import type { Database } from '../../lib/database.types';
+import {
+  uploadAvatar,
+  getAvatarPublicUrl,
+  deleteAvatar,
+  isDataUrl,
+  isSupabaseAvatarUrl,
+} from '../utils/supabaseAvatar';
+import { refreshAllStores } from '../utils/storeSync';
+import { getErrorDetail } from '../../lib/db/errors';
+import {
+  checkEmailAllowed,
+  isAllowedEmail,
+  isPolicyTriggerError,
+  EMAIL_POLICY_MESSAGE,
+} from '../utils/authEmailPolicy';
 
 // Auth Types
 export interface User {
   name: string;
   email: string;
   role: 'customer' | 'staff' | 'admin';
-  mfaEnabled?: boolean;
-  mfaVerified?: boolean;
+  profileImage?: string;
+  active?: boolean;
+  // Contact number from the profiles table (loaded on sign-in so the customer
+  // profile form can prefill it instead of leaking demo defaults).
+  phone?: string;
+  // Supabase auth uid (set when a real Supabase session is loaded; absent for
+  // local mock accounts).
+  id?: string;
 }
+
+// Result of asking Supabase to email a password-reset link. `code` keeps the
+// raw Supabase error code (e.g. "over_email_send_rate_limit",
+// "invalid_redirect_to") so a misconfigured deployment is diagnosable instead
+// of showing one generic "unable to send" message.
+export interface PasswordResetRequestResult {
+  success: boolean;
+  error?: string;
+  code?: string;
+}
+
+// Result of applying the new password from the emailed recovery link.
+// `reason: "no_session"` means the link carried no usable recovery session
+// (expired, already used, or opened without the token) - a different problem
+// from a rejected password, and it needs a different way out for the user.
+export interface PasswordResetUpdateResult {
+  success: boolean;
+  reason?: 'no_session' | 'rejected' | 'error';
+  error?: string;
+  code?: string;
+}
+
+// Which half of a signed-in password change failed: the check of the CURRENT
+// password (a sign-in attempt) or Supabase refusing the NEW one. This system
+// keeps no history of past passwords, so no message may claim a reused one.
+export type PasswordChangeResult =
+  | { success: true }
+  | { success: false; reason: 'current_password' | 'rejected' };
+
+// A profile save is two separate writes (text details, then the picture). Each
+// reports its own outcome so a page can name the half that failed and the real
+// reason, instead of one generic sentence blaming the whole save.
+export type ProfileSyncResult = { ok: true } | { ok: false; message: string };
+export type GoogleSignInResult =
+  | { success: true }
+  | { success: false; message: string };
 
 export interface AuthContextType {
   user: User | null;
-  login: (email: string, password: string) => { success: boolean; requiresMFA?: boolean };
-  verifyMFA: (code: string) => boolean;
-  enableMFA: () => string;
-  disableMFA: () => void;
-  signup: (data: any) => boolean;
+  authLoading: boolean;
+  // True when the last session was refused by the organization-email policy.
+  // The Google callback page reads this so it can explain the refusal
+  // instead of showing a generic "sign-in was not completed" message.
+  emailPolicyBlocked: boolean;
+  login: (email: string, password: string) => Promise<{ success: boolean; reason?: 'inactive' | 'domain' | 'invalid' }>;
+  signInWithGoogle: () => Promise<GoogleSignInResult>;
+  signup: (data: any) => Promise<boolean>;
+  registerStaff: (data: { name: string; email: string; password: string; role?: 'staff' | 'admin' }) => Promise<{ success: boolean; message?: string }>;
+  updateStaffAccount: (currentEmail: string, updates: { email?: string; name?: string; role?: 'staff' | 'admin'; active?: boolean }) => boolean;
+  getStaffAccounts: () => { email: string; name: string; role: string; active?: boolean; isAdminRegistered?: boolean }[];
+  updateProfile: (data: Partial<User> & { profileImage?: string | null }) => void;
+  updateProfileImage: (image: string | null) => Promise<ProfileSyncResult>;
+  syncProfileDetails: (patch: Database['public']['Tables']['profiles']['Update']) => Promise<ProfileSyncResult>;
   logout: () => void;
-  resetPassword: (email: string, currentPassword: string, newPassword: string) => boolean;
-  sendPasswordResetCode: (email: string) => boolean;
-  verifyResetCode: (email: string, code: string) => boolean;
+  resetPassword: (email: string, currentPassword: string, newPassword: string) => Promise<PasswordChangeResult>;
+  resetForgottenPassword: (email: string, newPassword: string) => Promise<PasswordResetUpdateResult>;
+  requestPasswordReset: (email: string) => Promise<PasswordResetRequestResult>;
 }
 
 export const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -32,58 +101,295 @@ export const useAuth = () => {
   return context;
 };
 
-// Mock users database - MFA is MANDATORY for all users
-const mockUsers = [
+// Roster mirror for the Staff page's list, role and active state only. It is
+// NOT an authentication path — sign-in always goes to Supabase, which stores a
+// bcrypt hash — so this shape deliberately has no password field.
+type MockUser = {
+  email: string;
+  name: string;
+  role: 'customer' | 'staff' | 'admin';
+  active: boolean;
+  profileImage?: string;
+  isAdminRegistered?: boolean;
+};
+
+const mockUsers: MockUser[] = [
   {
     email: 'customer@test.com',
-    password: 'customer123',
-    name: 'Ethan Laureen',
+    name: 'Customer User',
     role: 'customer' as const,
-    mfaEnabled: true,
-    mfaSecret: 'JBSWY3DPEHPK3PXP',
-    passwordHistory: [] as string[],
-  },
-  {
-    // Demo suspended account — 5 no-shows, account suspended
-    email: 'suspended@test.com',
-    password: 'suspended123',
-    name: 'Maria Santos',
-    role: 'customer' as const,
-    mfaEnabled: true,
-    mfaSecret: 'JBSWY3DPEHPK3PXP',
-    passwordHistory: [] as string[],
+    active: true,
+    profileImage: undefined,
   },
   {
     email: 'staff@test.com',
-    password: 'staff123',
-    name: 'Heaven Rica',
+    name: 'Staff User',
     role: 'staff' as const,
-    mfaEnabled: true,
-    mfaSecret: 'HXDMVJECJJWSRB3H',
-    passwordHistory: [] as string[],
+    active: true,
+    profileImage: undefined,
   },
   {
     email: 'admin@test.com',
-    password: 'admin123',
     name: 'Admin User',
     role: 'admin' as const,
-    mfaEnabled: true,
-    mfaSecret: 'JBSWY3DPFQQHO33S',
-    passwordHistory: [] as string[],
+    active: true,
+    profileImage: undefined,
   },
 ];
 
-// Store for password reset codes
-const passwordResetCodes: { [email: string]: string } = {};
+// The staff/admin roster mirror persists to localStorage so role and status
+// changes made in Staff Management survive a page refresh — otherwise the
+// freshly-updated MockUser list is re-seeded to the defaults on reload and the
+// changed role reverts. Only staff/admin accounts are persisted (customer
+// sign-ups stay in-memory, matching the original prototype behavior), and what
+// is stored is display data only: no password, ever.
+const STAFF_ACCOUNTS_KEY = 'docufy_auth_users_v1';
+
+function loadStaffAccounts(): void {
+  try {
+    const raw = localStorage.getItem(STAFF_ACCOUNTS_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    const accounts: MockUser[] = [];
+    let hadCredentials = false;
+    for (const acc of parsed) {
+      if (!acc || typeof acc !== 'object') continue;
+      if (!acc.email || !acc.name || !acc.role) continue;
+      if ('password' in acc || 'passwordHistory' in acc) hadCredentials = true;
+      // Rebuilt field by field rather than spread, so a stored `password` from
+      // an older build can never ride along into the mirror.
+      accounts.push({
+        email: acc.email,
+        name: acc.name,
+        role: acc.role,
+        active: acc.active !== false,
+        profileImage: acc.profileImage,
+        isAdminRegistered: acc.isAdminRegistered,
+      });
+    }
+    for (const acc of accounts) {
+      const idx = mockUsers.findIndex(u => u.email.toLowerCase() === acc.email.toLowerCase());
+      if (idx >= 0) {
+        mockUsers[idx] = { ...mockUsers[idx], ...acc };
+      } else {
+        mockUsers.push(acc);
+      }
+    }
+    // A browser left holding the old credential-bearing blob is scrubbed on its
+    // next load by rewriting the key from the now password-free mirror.
+    if (hadCredentials) persistStaffAccounts();
+  } catch {
+    // storage unavailable — in-memory accounts are enough
+  }
+}
+
+function persistStaffAccounts(): void {
+  try {
+    localStorage.setItem(
+      STAFF_ACCOUNTS_KEY,
+      JSON.stringify(mockUsers.filter(u => u.role !== 'customer')),
+    );
+  } catch {
+    // storage unavailable — accounts stay in-memory for the session
+  }
+}
+
+loadStaffAccounts();
+
+// Persist the logged-in user across page reloads so refreshing while signed in
+// does not bounce the user back to the login page. Uses sessionStorage (NOT
+// localStorage) so each browser tab keeps its own logged-in user — a prototype
+// convenience that lets separate tabs run as customer and staff/admin without
+// one refresh wiping the other tab's session.
+const AUTH_SESSION_KEY = 'docufy_auth_session_tab';
+
+// True only while an admin's registerStaff() call is in flight. With email
+// confirmation OFF, signUp activates the NEW staff user's session for a moment
+// before the admin's own session is restored; the session guard must ignore
+// those transient events instead of judging (and possibly signing out) them.
+let staffCreationInFlight = false;
+
+function readStoredUser(): User | null {
+  try {
+    const raw = sessionStorage.getItem(AUTH_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (!parsed.email || !parsed.name || !parsed.role) return null;
+    return parsed as User;
+  } catch {
+    return null;
+  }
+}
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const { showPopup } = usePopup();
   const [user, setUser] = useState<User | null>(null);
-  const [pendingMFAUser, setPendingMFAUser] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [emailPolicyBlocked, setEmailPolicyBlocked] = useState(false);
+
+  const loadProfile = async (authUser: { id: string; email?: string | null; user_metadata?: Record<string, unknown> }) => {
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('full_name, email, role, phone, profile_image_path, active, suspended')
+      .eq('id', authUser.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('Failed to load user profile:', error);
+    }
+
+    // If the profile has no phone yet but the signup put one in user_metadata
+    // (covers the email-confirmation-ON path where signup has no session),
+    // backfill the phone column so it ends up stored in the profiles table.
+    const metadataPhone =
+      typeof authUser.user_metadata?.phone === 'string' ? authUser.user_metadata.phone : '';
+
+    if (profile && !profile.phone && metadataPhone) {
+      await supabase
+        .from('profiles')
+        .update({ phone: metadataPhone })
+        .eq('id', authUser.id);
+      profile.phone = metadataPhone;
+    }
+
+    const role = profile?.role === 'admin' || profile?.role === 'staff'
+      ? profile.role
+      : 'customer';
+
+    setEmailPolicyBlocked(false);
+    setUser({
+      name: profile?.full_name || String(authUser.user_metadata?.full_name || authUser.email || 'User'),
+      email: profile?.email || authUser.email || '',
+      role,
+      profileImage: profile?.profile_image_path || undefined,
+      phone: profile?.phone || undefined,
+      active: profile?.active !== false && profile?.suspended !== true,
+      id: authUser.id,
+    });
+  };
+
+  // Organization-email policy — the net that catches every path we cannot
+  // pre-check. A Google sign-in creates the user implicitly (no signUp call),
+  // so its address is only known once the session exists; an account that
+  // predates the policy is caught here too. Either way the session is dropped
+  // instead of being allowed to browse the system.
+  const signOutDisallowed = (email?: string | null) => {
+    console.warn('[auth:email-policy] refused a session on a disallowed domain:', email);
+    setUser(null);
+    setEmailPolicyBlocked(true);
+    sessionManager.destroy();
+    // Deferred: calling an auth method straight inside onAuthStateChange can
+    // deadlock against supabase-js's internal lock.
+    setTimeout(() => {
+      void supabase.auth.signOut();
+    }, 0);
+    // No toast here: every path that reaches this ends on /login, where the
+    // organization-email window is shown and stays until the user dismisses it.
+  };
+
+  // The organization-email policy gates CUSTOMER accounts. Staff/admin accounts
+  // are created by an admin for the shop's own team and may use any address, so
+  // a session on a disallowed domain is checked against the profile role before
+  // it is dropped. Without this, a staff member created on e.g. a Gmail address
+  // would be signed out the instant their session appeared.
+  const isSessionAllowed = async (authUser: { id: string; email?: string | null }) => {
+    if (isAllowedEmail(authUser.email)) return true;
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', authUser.id)
+      .maybeSingle();
+    if (error) {
+      console.warn('[auth:email-policy] could not read the profile role:', error.message);
+    }
+    return profile?.role === 'staff' || profile?.role === 'admin';
+  };
+
+  useEffect(() => {
+    let mounted = true;
+
+    const initializeAuth = async () => {
+      try {
+        const { data, error } = await supabase.auth.getSession();
+        if (error) console.error('Failed to restore Supabase session:', error);
+        if (mounted && data.session?.user) {
+          if (!(await isSessionAllowed(data.session.user))) {
+            signOutDisallowed(data.session.user.email);
+          } else {
+            await loadProfile(data.session.user);
+            // Fetch the stores with the authenticated token (the module-constructor
+            // hydration ran anonymous and may have cached empty snapshots).
+            void refreshAllStores();
+          }
+        }
+      } finally {
+        // Single owner of the initial auth-gate: only release it AFTER the
+        // session/profile restore above has settled (and `setUser` ran), so a
+        // reload paints a blank `null` frame instead of flashing to /login.
+        // The onAuthStateChange callback deliberately does NOT clear this —
+        // its INITIAL_SESSION event fires before loadProfile resolves.
+        if (mounted) setAuthLoading(false);
+      }
+    };
+
+    void initializeAuth();
+
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+      if (session?.user) {
+        const authUser = session.user;
+        // A session the policy does not allow is dropped here (this is what
+        // catches the Google sign-in round trip). Deferred by a tick because a
+        // profile read straight inside onAuthStateChange can deadlock against
+        // supabase-js's internal auth lock.
+        setTimeout(() => {
+          void (async () => {
+            if (!mounted) return;
+            // A staff creation owns the session for a moment: signUp activates
+            // the new user, then the admin's session is restored. Ignore both
+            // events so the admin's state is never judged as the new account.
+            if (staffCreationInFlight) return;
+            // Ignore an event for a session that has already been replaced.
+            const { data: current } = await supabase.auth.getSession();
+            if (current.session?.user.id !== authUser.id) return;
+            if (!(await isSessionAllowed(authUser))) {
+              signOutDisallowed(authUser.email);
+              return;
+            }
+            if (!mounted) return;
+            void loadProfile(authUser);
+            void refreshAllStores();
+          })();
+        }, 0);
+      } else {
+        setUser(null);
+      }
+    });
+
+    return () => {
+      mounted = false;
+      subscription.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (user) {
+        sessionStorage.setItem(AUTH_SESSION_KEY, JSON.stringify(user));
+      } else {
+        sessionStorage.removeItem(AUTH_SESSION_KEY);
+      }
+    } catch {
+      // ignore storage errors
+    }
+  }, [user]);
 
   useEffect(() => {
     if (user) {
       sessionManager.init(() => {
-        toast.error('Session expired due to inactivity. Please log in again.');
+        showPopup('Session expired due to inactivity. Please log in again.', 'error');
         logout();
       });
     }
@@ -92,161 +398,598 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [user]);
 
-  const login = (email: string, password: string) => {
-    const foundUser = mockUsers.find(u => u.email === email && u.password === password);
-    if (foundUser) {
-      setPendingMFAUser(foundUser);
-      return { success: true, requiresMFA: true };
+  const login = async (email: string, password: string) => {
+    // A malformed address gets its own sentence. A well-formed one is NOT
+    // refused on its domain yet: staff/admin accounts may use any address, so
+    // the domain rule is applied after the account's role is known.
+    const policy = checkEmailAllowed(email);
+    if (!policy.allowed && policy.reason === 'invalid') {
+      return { success: false, reason: 'invalid' as const };
     }
-    return { success: false };
+
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error || !data.user) {
+      // A disallowed address that cannot sign in is almost always a customer
+      // trying a personal email - keep the policy explanation rather than the
+      // generic "invalid email or password".
+      return { success: false, reason: policy.allowed ? undefined : ('domain' as const) };
+    }
+
+    await loadProfile(data.user);
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role, active, suspended')
+      .eq('id', data.user.id)
+      .maybeSingle();
+
+    if (profile?.active === false || profile?.suspended === true) {
+      await supabase.auth.signOut();
+      return { success: false, reason: 'inactive' as const };
+    }
+
+    // Organization-email policy: it governs CUSTOMER accounts. Staff/admin
+    // accounts are admin-created for the shop's own team and may use any
+    // address, so only a non-staff account on a disallowed domain is refused.
+    const isStaffAccount = profile?.role === 'staff' || profile?.role === 'admin';
+    if (!isStaffAccount && !isAllowedEmail(data.user.email)) {
+      await supabase.auth.signOut();
+      return { success: false, reason: 'domain' as const };
+    }
+
+    void refreshAllStores();
+
+    toast.success("Logged in successfully.");
+
+    return { success: true };
   };
 
-  const verifyMFA = (code: string) => {
-    if (pendingMFAUser) {
-      if (code.length === 6 && /^\d{6}$/.test(code)) {
-        setUser({
-          name: pendingMFAUser.name,
-          email: pendingMFAUser.email,
-          role: pendingMFAUser.role,
-          mfaEnabled: true,
-          mfaVerified: true,
-        });
-        setPendingMFAUser(null);
-        return true;
-      } else {
-        toast.error('Invalid MFA code. Please enter a 6-digit code.');
+  // Request the Google URL without auto-redirecting so a stalled request can
+  // time out safely; then navigate the tab to Google and return to the callback.
+  const signInWithGoogle = async (): Promise<GoogleSignInResult> => {
+    let timeoutId: number | undefined;
+    try {
+      const request = supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: `${window.location.origin}/auth/callback`,
+          skipBrowserRedirect: true,
+        },
+      });
+      const result = await Promise.race([
+        request.then((value) => ({ kind: 'result' as const, value })),
+        new Promise<{ kind: 'timeout' }>((resolve) => {
+          timeoutId = window.setTimeout(
+            () => resolve({ kind: 'timeout' }),
+            15_000,
+          );
+        }),
+      ]);
+
+      if (result.kind === 'timeout') {
+        console.warn('[auth:google] OAuth initiation timed out.');
+        return {
+          success: false,
+          message:
+            'Google sign-in is taking too long to start. Check your internet connection and try again.',
+        };
       }
-    }
-    return false;
-  };
 
-  const enableMFA = () => {
-    const secret =
-      Math.random().toString(36).substring(2, 15) +
-      Math.random().toString(36).substring(2, 15);
-    if (user) {
-      const userIndex = mockUsers.findIndex(u => u.email === user.email);
-      if (userIndex !== -1) {
-        mockUsers[userIndex].mfaEnabled = true;
-        mockUsers[userIndex].mfaSecret = secret;
-        setUser({ ...user, mfaEnabled: true });
+      if (result.value.error || !result.value.data.url) {
+        console.warn(
+          '[auth:google] failed to start OAuth:',
+          result.value.error?.message ?? 'No authorization URL was returned.',
+        );
+        return {
+          success: false,
+          message:
+            'Could not start Google sign-in. Check your internet connection and try again.',
+        };
       }
+
+      window.location.assign(result.value.data.url);
+      return { success: true };
+    } catch (error) {
+      console.warn('[auth:google] failed to start OAuth:', error);
+      return {
+        success: false,
+        message:
+          'Could not start Google sign-in. Check your internet connection and try again.',
+      };
+    } finally {
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
     }
-    return secret;
   };
 
-  const disableMFA = () => {
-    if (user) {
-      const userIndex = mockUsers.findIndex(u => u.email === user.email);
-      if (userIndex !== -1) {
-        mockUsers[userIndex].mfaEnabled = false;
-        mockUsers[userIndex].mfaSecret = '';
-        setUser({ ...user, mfaEnabled: false });
-      }
+  const signup = async (data: any) => {
+    // Organization-email policy: refuse a personal address before the account
+    // is created, so no auth user and no profile row are left behind.
+    const policy = checkEmailAllowed(data.email);
+    if (!policy.allowed) {
+      toast.error(policy.message || EMAIL_POLICY_MESSAGE);
+      return false;
     }
-  };
 
-  const signup = (data: any) => {
     // Combine firstName and lastName to create full name
     const fullName = data.firstName && data.lastName
       ? `${data.firstName} ${data.lastName}`.trim()
       : data.fullName || data.name || 'User';
 
-    const newUser = {
+    const { data: result, error } = await supabase.auth.signUp({
       email: data.email,
       password: data.password,
-      name: fullName,
-      role: 'customer' as const,
-      mfaEnabled: true,
-      mfaSecret: Math.random().toString(36).substring(2, 15),
-      passwordHistory: [] as string[],
-    };
-    mockUsers.push(newUser);
-    toast.success(
-      'Account created! MFA is required for all accounts. You will be prompted to verify on login.'
+      options: {
+        data: {
+          full_name: fullName,
+          phone: data.contactNumber,
+        },
+      },
+    });
+
+    if (error || !result.user) {
+      showPopup(
+        isPolicyTriggerError(error?.message)
+          ? EMAIL_POLICY_MESSAGE
+          : error?.message || 'Unable to create account.',
+        'error',
+      );
+      return false;
+    }
+
+    if (result.session) {
+      const profileUpdates: Database['public']['Tables']['profiles']['Update'] = {};
+      if (data.contactNumber) {
+        profileUpdates.phone = data.contactNumber;
+      }
+      if (data.profileImage && isDataUrl(data.profileImage)) {
+        try {
+          // Upload the picture to Supabase Storage and keep the public URL in
+          // the profiles table so the avatar survives across devices/sessions.
+          const path = await uploadAvatar(result.user.id, data.profileImage);
+          profileUpdates.profile_image_path = getAvatarPublicUrl(path);
+        } catch (uploadError) {
+          console.warn('Failed to upload profile image during signup:', uploadError);
+        }
+      }
+      if (Object.keys(profileUpdates).length > 0) {
+        await supabase
+          .from('profiles')
+          .update(profileUpdates)
+          .eq('id', result.user.id);
+      }
+      await loadProfile(result.user);
+      void refreshAllStores();
+    }
+
+    showPopup(
+      result.session
+        ? 'Account created successfully.'
+        : 'Account created. Check your email to confirm your account.',
+      'success',
     );
     return true;
   };
 
+  const registerStaff = async (data: { name: string; email: string; password: string; role?: 'staff' | 'admin' }) => {
+    const { normalizeEmailForSave: normEmail, normalizeNameForSave: normName } = await import("../utils/inputSanitizers");
+    data.name = normName(data.name);
+    data.email = normEmail(data.email);
+    if (!data.name || !data.email || !data.password) {
+      return { success: false, message: 'All fields are required.' };
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(data.email)) {
+      return { success: false, message: 'Please enter a valid email address.' };
+    }
+    // No organization-domain gate here on purpose: staff/admin accounts are
+    // created by an admin for the shop's own team and may use any address. The
+    // policy still governs customer self-registration and customer sign-in.
+    if (mockUsers.some(u => u.email.toLowerCase() === data.email.toLowerCase())) {
+      return {
+        success: false,
+        message: "An account with this email already exists. Use a different address, or reset that account's password.",
+      };
+    }
+
+    const requestedRole: 'staff' | 'admin' = data.role || 'staff';
+
+    // Snapshot the acting admin's session: with email confirmation OFF, signUp
+    // returns (and would ACTIVATE) a session for the brand-new staff user,
+    // which would silently swap the admin out of their own session. We restore
+    // the admin session right after so the staff creation never logs the admin out.
+    const { data: beforeSession } = await supabase.auth.getSession();
+    const actingSession = beforeSession.session;
+
+    const restoreActingSession = async () => {
+      if (!actingSession) return;
+      await supabase.auth.setSession({
+        access_token: actingSession.access_token,
+        refresh_token: actingSession.refresh_token,
+      });
+    };
+
+    staffCreationInFlight = true;
+    try {
+      // Create a REAL Supabase Auth user (so the new staff can actually sign in).
+      const { data: signUpResult, error: signUpError } = await supabase.auth.signUp({
+        email: data.email,
+        password: data.password,
+        options: { data: { full_name: data.name, role: requestedRole } },
+      });
+
+      await restoreActingSession();
+
+      if (signUpError || !signUpResult?.user) {
+        // Already a real auth user (e.g. staff@test.com or a customer) →
+        // friendly duplicate message instead of a raw "User already registered".
+        return {
+          success: false,
+          message: isPolicyTriggerError(signUpError?.message)
+            ? 'The database refused this email address. An admin-created staff account on a non-organization domain needs the email-policy trigger to allow it (see the SQL in the project notes).'
+            : signUpError?.message?.toLowerCase().includes('already')
+              ? "An account with this email already exists. Use a different address, or reset that account's password."
+              : signUpError?.message || 'Could not create staff account.',
+        };
+      }
+
+      // With email confirmation ON, Supabase answers an address that already
+      // has an account with a decoy user (no identities, no error) so the API
+      // never reveals which emails are registered. Treat it as a duplicate.
+      if ((signUpResult.user.identities?.length ?? 0) === 0) {
+        return {
+          success: false,
+          message: "An account with this email already exists. Use a different address, or reset that account's password.",
+        };
+      }
+
+      const newUserId = signUpResult.user.id;
+
+      // The handle_new_user() trigger only copies full_name/email, so the new
+      // profile's role defaults to 'customer' — raise it to the requested role
+      // so the account actually logs in with staff/admin permissions.
+      // `.select()` makes the row count visible: RLS refuses an admin UPDATE of
+      // another user's row by returning zero rows with NO error, which used to
+      // be swallowed and reported as a successful creation.
+      const { data: updatedProfile, error: roleError } = await supabase
+        .from('profiles')
+        .update({ role: requestedRole, active: true })
+        .eq('id', newUserId)
+        .select('id, role, active');
+
+      if (roleError || !updatedProfile || updatedProfile.length === 0) {
+        console.error('[auth:registerStaff] could not elevate the new profile role:', roleError);
+        return {
+          success: false,
+          message:
+            'The login account was created, but its staff permissions could not be saved' +
+            (roleError ? `: ${getErrorDetail(roleError) ?? roleError.message}.` : '.') +
+            " The profiles table refused an admin update to another user's row — apply the admin profile-update policy, then try again with a different email.",
+        };
+      }
+
+      // Confirm the new account can actually sign in. With "Confirm email" ON,
+      // signUp creates the user but returns NO session, and signInWithPassword
+      // keeps answering "Invalid login credentials" until the address is
+      // confirmed — which is exactly how a brand-new staff account ended up
+      // unusable while the UI said it was registered.
+      if (!signUpResult.session) {
+        const { error: probeError } = await supabase.auth.signInWithPassword({
+          email: data.email,
+          password: data.password,
+        });
+        await restoreActingSession();
+        if (probeError) {
+          const unconfirmed =
+            probeError.code === 'email_not_confirmed' ||
+            /not confirmed|confirm your/i.test(probeError.message);
+          return {
+            success: false,
+            message: unconfirmed
+              ? 'The account was created, but Supabase holds it as "email not confirmed", so signing in is refused. Turn off Confirm email (Authentication → Providers → Email) or confirm the address with the SQL in the project notes, then set the password again.'
+              : `The account was created, but signing in failed: ${probeError.message}`,
+          };
+        }
+      }
+
+      // Keep the local roster mirror in sync so Staff Management lists the new
+      // account immediately. The password deliberately is NOT copied here: the
+      // real credential lives only as Supabase's server-side hash.
+      const newStaff: MockUser = {
+        email: data.email,
+        name: data.name,
+        role: requestedRole,
+        active: true,
+        profileImage: undefined,
+        isAdminRegistered: true,
+      };
+      mockUsers.push(newStaff);
+      persistStaffAccounts();
+      return { success: true };
+    } finally {
+      staffCreationInFlight = false;
+    }
+  };
+
+  // Push role/active changes to the REAL Supabase profile row (the login gate
+  // reads profiles.role/active). Best-effort: a row missing a matching real
+  // account keeps the local mirror only.
+  const syncRealStaffProfile = async (currentEmail: string, updates: {
+    email?: string;
+    name?: string;
+    role?: 'staff' | 'admin';
+    active?: boolean;
+  }) => {
+    try {
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('email', currentEmail.toLowerCase())
+        .maybeSingle();
+      if (!profile) return;
+      const patch: Database['public']['Tables']['profiles']['Update'] = {};
+      if (typeof updates.name === 'string') patch.full_name = updates.name;
+      if (updates.role === 'staff' || updates.role === 'admin') patch.role = updates.role;
+      if (typeof updates.active === 'boolean') patch.active = updates.active;
+      if (Object.keys(patch).length === 0) return;
+      await supabase.from('profiles').update(patch).eq('id', profile.id);
+    } catch (err) {
+      console.warn('[auth:updateStaffAccount] could not sync real profile:', err);
+    }
+  };
+
+  const updateStaffAccount = (currentEmail: string, updates: {
+    email?: string;
+    name?: string;
+    role?: 'staff' | 'admin';
+    active?: boolean;
+  }) => {
+    const userIndex = mockUsers.findIndex(
+      u => u.email.toLowerCase() === currentEmail.toLowerCase() && u.role !== 'customer'
+    );
+    if (userIndex === -1) return false;
+    if (updates.email) {
+      const conflict = mockUsers.some(
+        (u, i) => i !== userIndex && u.email.toLowerCase() === updates.email!.toLowerCase()
+      );
+      if (conflict) return false;
+      mockUsers[userIndex].email = updates.email;
+    }
+    if (typeof updates.name === 'string') mockUsers[userIndex].name = updates.name;
+    if (updates.role === 'staff' || updates.role === 'admin') mockUsers[userIndex].role = updates.role;
+    if (typeof updates.active === 'boolean') mockUsers[userIndex].active = updates.active;
+    persistStaffAccounts();
+
+    // Best-effort: push role/active changes up to the REAL Supabase profile too
+    // (the account may have been created as a real Auth user). The login gate
+    // reads profiles.active/role, so a deactivate or role change here must be
+    // reflected there or the DB row would override it on the next sign-in.
+    void syncRealStaffProfile(currentEmail, updates);
+    return true;
+  };
+
+  const getStaffAccounts = () =>
+    mockUsers
+      .filter(u => u.role !== 'customer')
+      .map(u => ({
+        email: u.email,
+        name: u.name,
+        role: u.role,
+        active: u.active,
+        isAdminRegistered: u.isAdminRegistered,
+      }));
+
+  const updateProfile = (data: Partial<User> & { profileImage?: string | null }) => {
+    setUser((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        ...data,
+        profileImage: Object.prototype.hasOwnProperty.call(data, "profileImage")
+          ? data.profileImage || undefined
+          : current.profileImage,
+      };
+    });
+  };
+
+  // Persist editable profile text fields (name, phone) to the signed-in user's
+  // OWN `profiles` row. The profile pages have already written the text to their
+  // per-account localStorage blob, so a refused push is reported by the page and
+  // the editor stays open for a retry.
+  const syncProfileDetails = async (
+    patch: Database['public']['Tables']['profiles']['Update'],
+  ): Promise<ProfileSyncResult> => {
+    if (!patch || Object.keys(patch).length === 0) return { ok: true };
+    try {
+      const { data: authData } = await supabase.auth.getUser();
+      const authUserId = authData.user?.id;
+      if (!authUserId) return { ok: false, message: 'You are signed out — sign in again to save.' };
+      // `.select('id')` makes the row count visible: RLS refuses an UPDATE by
+      // returning zero rows with no error, which used to be indistinguishable
+      // from success.
+      const { data, error } = await supabase
+        .from('profiles')
+        .update(patch)
+        .eq('id', authUserId)
+        .select('id');
+      if (error) {
+        console.error('[db:profiles.update]', error);
+        return { ok: false, message: getErrorDetail(error) ?? 'The server rejected the update.' };
+      }
+      if (!data || data.length === 0) {
+        return { ok: false, message: "Your profile record couldn't be updated." };
+      }
+      const localSync: Partial<User> = {};
+      if (typeof patch.full_name === 'string') localSync.name = patch.full_name;
+      if (patch.phone !== undefined) localSync.phone = patch.phone ?? undefined;
+      if (Object.keys(localSync).length > 0) updateProfile(localSync);
+      return { ok: true };
+    } catch (err) {
+      console.error('[db:profiles.update]', err);
+      return { ok: false, message: getErrorDetail(err) ?? 'The request never reached the server.' };
+    }
+  };
+
+  // Persist a profile picture to Supabase Storage + the profiles table.
+  // - image (base64 data URL): uploads a new avatar and stores its public URL.
+  // - image (already-public URL): no change, nothing to do.
+  // - image === null: clears the stored avatar.
+  // Both writes are checked: the storage upload AND the `profiles` row. The row
+  // write used to discard its error, so a rejected update still reported success.
+  // Avatars are NEVER stored locally; Supabase is their only home.
+  const updateProfileImage = async (image: string | null): Promise<ProfileSyncResult> => {
+    if (!user) return { ok: false, message: 'You are signed out — sign in again to save.' };
+    if ((image ?? null) === (user.profileImage ?? null)) return { ok: true };
+    try {
+      const { data: authData } = await supabase.auth.getUser();
+      const authUserId = authData.user?.id;
+      if (!authUserId) return { ok: false, message: 'You are signed out — sign in again to save.' };
+
+      if (image && !isDataUrl(image)) {
+        // Already a persisted URL (unchanged picture) — nothing to upload.
+        return { ok: true };
+      }
+
+      const previous = user.profileImage;
+      const url = image ? getAvatarPublicUrl(await uploadAvatar(authUserId, image)) : null;
+
+      const { data, error } = await supabase
+        .from('profiles')
+        .update({ profile_image_path: url })
+        .eq('id', authUserId)
+        .select('id');
+      if (error) {
+        console.error('[db:profiles.avatar]', error);
+        if (url) void deleteAvatar(url); // don't leave an orphan object behind
+        return { ok: false, message: getErrorDetail(error) ?? 'The server rejected the photo.' };
+      }
+      if (!data || data.length === 0) {
+        if (url) void deleteAvatar(url);
+        return { ok: false, message: "Your profile record couldn't be updated." };
+      }
+
+      updateProfile({ profileImage: url ?? undefined });
+      if (previous && previous !== url && isSupabaseAvatarUrl(previous)) {
+        void deleteAvatar(previous);
+      }
+      return { ok: true };
+    } catch (err) {
+      console.error('[db:profiles.avatar]', err);
+      return { ok: false, message: getErrorDetail(err) ?? "The photo couldn't be uploaded." };
+    }
+  };
+
   const logout = () => {
     setUser(null);
-    setPendingMFAUser(null);
     sessionManager.destroy();
+    void supabase.auth.signOut();
   };
 
-  const sendPasswordResetCode = (email: string) => {
-    const foundUser = mockUsers.find(u => u.email === email);
-    if (foundUser) {
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
-      passwordResetCodes[email] = code;
-      console.log(`Password reset code for ${email}: ${code}`);
-      toast.success(`Reset code sent to ${email}. Check console for demo code.`);
-      return true;
+  const resetPassword = async (
+    email: string,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<PasswordChangeResult> => {
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email,
+      password: currentPassword,
+    });
+    if (signInError) return { success: false, reason: 'current_password' };
+
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) {
+      console.warn('[auth] password change refused:', error.code, error.message);
+      return { success: false, reason: 'rejected' };
     }
-    return false;
+    return { success: true };
   };
 
-  const verifyResetCode = (email: string, code: string) => {
-    return passwordResetCodes[email] === code;
-  };
+  const resetForgottenPassword = async (
+    _email: string,
+    newPassword: string,
+  ): Promise<PasswordResetUpdateResult> => {
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
 
-  const resetPassword = (email: string, currentPassword: string, newPassword: string) => {
-    console.log('resetPassword called for:', email);
-    console.log('Current user in mockUsers:', mockUsers.find(u => u.email === email));
+    if (error) {
+      // A missing recovery session means the emailed link never carried a
+      // usable token (expired, already used, or the page was reached without
+      // the token) - a different failure from a password the server refuses,
+      // and it needs a different way out for the user.
+      const message = error.message || '';
+      const noSession =
+        error.name === 'AuthSessionMissingError' ||
+        error.code === 'session_not_found' ||
+        /session missing|not authenticated|invalid.*jwt/i.test(message);
 
-    const userIndex = mockUsers.findIndex(
-      u => u.email === email && u.password === currentPassword
-    );
+      console.warn('[auth] password reset update failed:', error.code, message);
 
-    console.log('User index found:', userIndex);
-
-    if (userIndex !== -1) {
-      const user = mockUsers[userIndex];
-
-      // Check password reuse - prevent using any of the last 5 passwords
-      const passwordHistory = user.passwordHistory || [];
-      const recentPasswords = [user.password, ...passwordHistory].slice(0, 5);
-
-      console.log('Recent passwords:', recentPasswords);
-      console.log('New password:', newPassword);
-
-      if (recentPasswords.includes(newPassword)) {
-        console.log('Password reuse detected');
-        return false; // Error will be shown by the calling component
-      }
-
-      // Update password history
-      mockUsers[userIndex].passwordHistory = [user.password, ...passwordHistory].slice(0, 5);
-      mockUsers[userIndex].password = newPassword;
-
-      console.log('Password updated successfully');
-      console.log('New password is now:', mockUsers[userIndex].password);
-
-      // Update the current user's session state if they're logged in
-      if (user && user.email === email) {
-        setUser({ ...user, name: user.name, email: user.email, role: user.role, mfaEnabled: user.mfaEnabled });
-      }
-
-      return true; // Success will be shown by the calling component
+      return {
+        success: false,
+        reason: noSession ? 'no_session' : 'rejected',
+        code: error.code,
+        error: noSession
+          ? 'This reset link is invalid or has expired.'
+          : message || 'We could not update your password. Please try a different one.',
+      };
     }
 
-    console.log('User not found or current password incorrect');
-    return false;
+    // The password-recovery link logs the user in with a recovery session.
+    // Without signing out, that lingering session makes LoginPage's "already
+    // signed in" effect redirect straight to /<role>/dashboard instead of
+    // showing the login form the user needs after resetting their password.
+    await supabase.auth.signOut();
+    return { success: true };
+  };
+
+  const requestPasswordReset = async (email: string): Promise<PasswordResetRequestResult> => {
+    // No organization-domain gate: staff/admin accounts are admin-created and
+    // may sit on any address, so a recovery link must be reachable for them
+    // too. Supabase answers the same way for an unknown address, so nothing is
+    // leaked to a customer on a personal domain.
+    if (!email || !email.includes('@')) {
+      return { success: false, code: 'invalid_email', error: 'Please enter a valid email address.' };
+    }
+
+    // The link has to point back at THIS deployment. Supabase only honours a
+    // redirect target that is listed in the project's Redirect URLs
+    // allow-list; when it is not, the emailed link silently falls back to the
+    // project's Site URL (which is often still localhost from local
+    // development) and the reset link becomes unusable.
+    const redirectTo = `${window.location.origin}/reset-password`;
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
+
+    if (error) {
+      console.warn('[auth] password reset request failed:', error.code, error.message);
+      const rateLimited = error.code === 'over_email_send_rate_limit';
+      return {
+        success: false,
+        code: error.code,
+        error: rateLimited
+          ? 'Too many reset emails were requested. Wait a minute and try again.'
+          : 'We could not send the reset link. Please try again in a moment.',
+      };
+    }
+
+    return { success: true };
   };
 
   return (
     <AuthContext.Provider
       value={{
         user,
+        authLoading,
+        emailPolicyBlocked,
         login,
-        verifyMFA,
-        enableMFA,
-        disableMFA,
+        signInWithGoogle,
         signup,
+        registerStaff,
+        updateStaffAccount,
+        getStaffAccounts,
+        updateProfile,
+        updateProfileImage,
+        syncProfileDetails,
         logout,
         resetPassword,
-        sendPasswordResetCode,
-        verifyResetCode,
+        resetForgottenPassword,
+        requestPasswordReset,
       }}
     >
       {children}

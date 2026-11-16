@@ -8,10 +8,10 @@ import {
   MapPin,
   Package,
   Calendar,
+  CalendarClock,
+  Banknote,
   Info,
   User,
-  Mail,
-  Phone,
   Link2,
   MessageSquare,
   ChevronDown,
@@ -19,11 +19,13 @@ import {
   ExternalLink,
   CheckCircle,
   Eye,
+  ArrowLeft,
 } from 'lucide-react';
 import Layout from '../Layout';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
+import { PersonAvatar } from '../ui/person-avatar';
 import {
   Dialog,
   DialogContent,
@@ -31,8 +33,18 @@ import {
   DialogTitle,
   DialogDescription,
 } from '../ui/dialog';
-import { applicationsStore, ApplicationType } from '../../utils/applicationsStore';
-import { jobsStore } from '../../utils/jobsStore';
+import {
+  applicationsStore,
+  applicationDisplayId,
+  openApplicationPortfolio,
+  ApplicationType,
+} from '../../utils/applicationsStore';
+import { CardSkeleton } from '../ui/card-skeleton';
+import { useHydrating } from '../../utils/useHydrating';
+import { jobsStore, type JobType } from '../../utils/jobsStore';
+import { applicationStatusStyle } from '../../utils/applicationStatus';
+import { landingContentStore } from '../../utils/landingContentStore';
+import { formatClockTime, formatPHDate } from '../../utils/pht';
 
 const menuItems = [
   { label: 'Dashboard', path: '/customer/dashboard', icon: <LayoutDashboard className="w-5 h-5" /> },
@@ -41,23 +53,25 @@ const menuItems = [
   { label: 'Job Board', path: '/customer/job-board', icon: <Briefcase className="w-5 h-5" /> },
 ];
 
-const STATUS_COLORS: Record<string, string> = {
-  Pending: 'bg-gray-100 text-gray-700 border-gray-200',
-  'Under Review': 'bg-white border-2 border-blue-200 text-blue-700 border-green-200',
-  'For Interview': 'bg-purple-50 text-purple-700 border-purple-200',
-  Approved: 'bg-white border-2 border-blue-200 text-blue-700 border-green-200',
-  Rejected: 'bg-white border-2 border-blue-200 text-red-500 border-green-200',
-};
+// `appliedDateTime` holds "YYYY-MM-DD h:mm AM/PM"; the date half is re-rendered
+// in the reader's locale, so only the time is reused from it.
+function appliedTime(value: string): string {
+  return value.length > 11 ? value.slice(11).trim() : "";
+}
 
 export default function JobBoard() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const hydrating = useHydrating();
   const [tab, setTab] = useState<'listings' | 'applications'>('listings');
-  const [jobs, setJobs] = useState<any[]>([]);
+  const [jobs, setJobs] = useState<JobType[]>([]);
   const [applications, setApplications] = useState<ApplicationType[]>([]);
   const [selectedApp, setSelectedApp] = useState<ApplicationType | null>(null);
   const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
   const [showSuccessDialog, setShowSuccessDialog] = useState(false);
+  const [shopAddress, setShopAddress] = useState(() =>
+    landingContentStore.getContent().locationLines.filter(Boolean).join(', '),
+  );
 
   useEffect(() => {
     // Load active jobs from centralized store (exclude archived jobs)
@@ -72,9 +86,15 @@ export default function JobBoard() {
       setApplications(applicationsStore.getApplications());
     });
 
+    // The shop address is admin-editable, so it must not be typed into this page.
+    const unsubContent = landingContentStore.subscribe(() => {
+      setShopAddress(landingContentStore.getContent().locationLines.filter(Boolean).join(', '));
+    });
+
     return () => {
       unsubJobs();
       unsubApps();
+      unsubContent();
     };
   }, []);
 
@@ -115,39 +135,50 @@ export default function JobBoard() {
     applications.find((a) => a.jobId === jobId);
 
   return (
-    <Layout menuItems={menuItems} title="Job Board" showBackButton>
-      <div className="space-y-8 max-w-5xl mx-auto">
+    <Layout menuItems={menuItems} title="Job Board" showBackButton hideMobileBackButton>
+      <div className="space-y-4 max-w-5xl mx-auto">
+
+        {/* Mobile back button (under the header) */}
+        <button
+          type="button"
+          onClick={() => navigate(-1)}
+          aria-label="Go back"
+          className="md:hidden inline-flex items-center gap-1 rounded-xl p-2 pl-0 text-gray-600 hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]"
+        >
+          <ArrowLeft className="h-5 w-5" />
+          <span className="text-sm font-medium">Back</span>
+        </button>
 
         {/* Page Header */}
-        <div className="flex items-start justify-between gap-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
           <div>
-            <p className="text-gray-500 mt-1">
-              Browse opportunities at DocuFy PSMS · Room 4, TBI Building, Palawan State University
+            <p className="text-sm text-gray-500 sm:text-base">
+              Browse opportunities at Docufy PSMS{shopAddress ? ` · ${shopAddress}` : ""}
             </p>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex w-full flex-row gap-2 sm:w-auto sm:flex-row sm:items-center sm:gap-2">
             <button
               onClick={() => setTab('listings')}
-              className={`px-5 py-2 rounded-xl text-sm font-semibold border-2 transition-all ${
+              className={`w-full rounded-xl border-2 px-4 py-2.5 text-sm font-semibold transition-all sm:w-auto ${
                 tab === 'listings'
-                  ? 'bg-[#1D73EC] text-white border-[#1D73EC] shadow-md'
-                  : 'bg-white text-gray-600 border-gray-200 hover:border-[#1D73EC] hover:text-[#1D73EC]'
+                  ? 'bg-[#1668D9] text-white border-[#1668D9] shadow-md'
+                  : 'bg-white text-gray-600 border-gray-200 hover:border-[#1668D9] hover:text-[#1668D9]'
               }`}
             >
               Job Listings
             </button>
             <button
               onClick={() => setTab('applications')}
-              className={`px-5 py-2 rounded-xl text-sm font-semibold border-2 transition-all relative ${
+              className={`relative w-full rounded-xl border-2 px-4 py-2.5 text-sm font-semibold transition-all sm:w-auto ${
                 tab === 'applications'
-                  ? 'bg-[#1D73EC] text-white border-[#1D73EC] shadow-md'
-                  : 'bg-white text-gray-600 border-gray-200 hover:border-[#1D73EC] hover:text-[#1D73EC]'
+                  ? 'bg-[#1668D9] text-white border-[#1668D9] shadow-md'
+                  : 'bg-white text-gray-600 border-gray-200 hover:border-[#1668D9] hover:text-[#1668D9]'
               }`}
             >
               My Applications
               {applications.length > 0 && (
-                <span className={`ml-2 px-1.5 py-0.5 rounded-full text-[10px] font-bold ${
-                  tab === 'applications' ? 'bg-white/20 text-white' : 'bg-[#1D73EC] text-white'
+                <span className={`ml-2 rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                  tab === 'applications' ? 'bg-white/20 text-white' : 'bg-[#1668D9] text-white'
                 }`}>
                   {applications.length}
                 </span>
@@ -156,119 +187,189 @@ export default function JobBoard() {
           </div>
         </div>
 
-        {/* ── JOB LISTINGS ── */}
+        {/* -- JOB LISTINGS -- */}
         {tab === 'listings' && (
-          <div className="space-y-5">
-            {jobs.map((job) => {
+          <>
+          {hydrating && <CardSkeleton cards={3} columns={1} label="Loading job listings" />}
+          <div className={hydrating ? "hidden" : "space-y-3"}>
+            {jobs.length === 0 ? (
+              <Card className="border border-gray-100 bg-white p-16 text-center shadow-sm">
+                <Briefcase className="mx-auto mb-4 h-10 w-10 text-[#1668D9]/35" />
+                <p className="text-lg font-semibold text-gray-500">No job listings available</p>
+                <p className="mt-1 text-sm text-gray-500">New opportunities will appear here when they are posted.</p>
+              </Card>
+            ) : jobs.map((job) => {
               const application = getApplicationForJob(job.id);
               const isExpanded = expandedJobId === job.id;
 
               return (
                 <Card
                   key={job.id}
-                  className="overflow-hidden bg-white shadow-sm hover:shadow-md transition-shadow border border-gray-100"
+                  className={`overflow-hidden border border-gray-100 bg-white shadow-sm transition-shadow hover:shadow-md gap-0`}
                 >
-                  {/* Main Row */}
-                  <div className="p-6">
-                    <div className="flex items-start gap-4">
-                      {/* Icon */}
-                      <div className="w-12 h-12 bg-[#F2F7FF] rounded-xl flex items-center justify-center flex-shrink-0 border border-blue-100">
-                        <Briefcase className="w-6 h-6 text-[#1D73EC]" />
+                  <div className="p-4 sm:p-6">
+                    <div className="flex flex-col gap-4 sm:flex-row sm:items-start">
+                      <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-blue-100 bg-[#F2F7FF]">
+                        <Briefcase className="h-6 w-6 text-[#1668D9]" />
                       </div>
 
-                      {/* Info */}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-start justify-between gap-4">
-                          <div>
-                            <h3 className="text-lg font-bold text-[#1c1f26]">{job.title}</h3>
-                            <div className="flex flex-wrap items-center gap-2 mt-1.5">
-                              <Badge className="bg-white border-2 border-blue-200 text-blue-700 border border-green-200 text-xs">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <h3 className="text-base font-bold text-[#1c1f26] sm:text-lg">{job.title}</h3>
+                            <div className="mt-1.5 flex flex-wrap items-center gap-1">
+                              <Badge className="text-xs bg-blue-100 text-blue-700">
                                 {job.type}
                               </Badge>
-                              <span className="text-xs text-gray-400">·</span>
-                              <span className="text-xs text-gray-500">{job.department}</span>
-                              <span className="text-xs text-gray-400">·</span>
+                              {job.department && (
+                                <>
+                                  <span className="text-xs text-gray-500">·</span>
+                                  <span className="text-xs text-gray-500">{job.department}</span>
+                                </>
+                              )}
+                              <span className="text-xs text-gray-500">·</span>
                               <span className="text-xs text-gray-500">Posted {job.posted}</span>
                               {application && (
-                                <Badge className={`text-xs border ${STATUS_COLORS[application.status]}`}>
+                                <Badge className={`text-xs border ${applicationStatusStyle(application.status).badge}`}>
                                   {application.status}
                                 </Badge>
                               )}
                             </div>
                           </div>
 
-                          {/* Action Buttons */}
-                          <div className="flex items-center gap-2 flex-shrink-0">
+                          <div className="order-3 flex w-full flex-col gap-2 sm:order-2 sm:w-auto sm:flex-row sm:items-center">
                             <button
                               onClick={() => setExpandedJobId(isExpanded ? null : job.id)}
-                              className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium text-gray-600 border border-gray-200 hover:bg-gray-50 transition-colors"
+                              aria-expanded={isExpanded}
+                              className="flex items-center justify-center gap-1 rounded-lg border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:bg-gray-50"
                             >
                               {isExpanded ? (
-                                <><ChevronUp className="w-3.5 h-3.5" /> Less</>
+                                <><ChevronUp className="h-3.5 w-3.5" /> Less</>
                               ) : (
-                                <><ChevronDown className="w-3.5 h-3.5" /> Details</>
+                                <><ChevronDown className="h-3.5 w-3.5" /> Details</>
                               )}
                             </button>
-                            {application && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                disabled
-                                className="text-xs opacity-60"
-                              >
-                                Applied
-                              </Button>
+                          </div>
+
+                          <div className="order-2 flex flex-col gap-2 text-xs text-gray-500 sm:order-3 sm:basis-full sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-5 sm:gap-y-2">
+                            {job.salary && (
+                              <span className="flex items-center gap-1.5">
+                                <Banknote className="h-3.5 w-3.5" /> {job.salary}
+                              </span>
+                            )}
+                            {job.schedule && (
+                              <span className="flex items-center gap-1.5">
+                                <CalendarClock className="h-3.5 w-3.5" /> {job.schedule}
+                              </span>
+                            )}
+                            <span className="flex items-center gap-1.5">
+                              <MapPin className="h-3.5 w-3.5" /> {job.location || shopAddress || "Ask at the shop"}
+                            </span>
+                            {job.duration && (
+                              <span className="flex items-center gap-1.5">
+                                <Clock className="h-3.5 w-3.5" /> {job.duration}
+                              </span>
                             )}
                           </div>
-                        </div>
-
-                        {/* Meta */}
-                        <div className="flex items-center gap-5 mt-3 text-xs text-gray-500">
-                          <span className="flex items-center gap-1.5">
-                            <Clock className="w-3.5 h-3.5" /> {job.duration}
-                          </span>
-                          <span className="flex items-center gap-1.5">
-                            <MapPin className="w-3.5 h-3.5" /> Room 4, PSU Main Campus, TBI Building
-                          </span>
                         </div>
                       </div>
                     </div>
                   </div>
 
-                  {/* Expandable Details */}
-                  {isExpanded && (
-                    <div className="border-t border-gray-100 bg-gray-50/50 px-6 py-5">
-                      <p className="text-sm text-gray-700 leading-relaxed">{job.description}</p>
-                      {!application && (
-                        <div className="mt-4">
-                          <Button
-                            className="bg-[#1D73EC] hover:bg-[#10316B] text-white text-sm"
-                            onClick={() => navigate(`/customer/job-apply/${job.id}`)}
-                          >
-                            Apply for this Position
-                          </Button>
-                        </div>
-                      )}
+                  <div
+                    className={`grid transition-[grid-template-rows] duration-300 ease-in-out ${isExpanded ? "grid-rows-[1fr]" : "grid-rows-[0fr]"}`}
+                  >
+                    <div className="min-h-0 overflow-hidden">
+                      <div className="border-t border-gray-100 bg-gray-50/50 px-4 pt-3 pb-4 sm:px-6 sm:pt-4 sm:pb-5">
+                        <p className="text-sm leading-relaxed text-gray-700">{job.description}</p>
+
+                        {job.responsibilities && job.responsibilities.length > 0 && (
+                          <div className="mt-4">
+                            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                              What you'll be doing
+                            </p>
+                            <ul className="mt-2 space-y-1.5">
+                              {job.responsibilities.map((item, idx) => (
+                                <li key={idx} className="flex gap-2 text-sm text-gray-700 leading-relaxed">
+                                  <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[#1668D9]" />
+                                  <span>{item}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {job.requirements && job.requirements.length > 0 && (
+                          <div className="mt-4">
+                            <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">
+                              What we're looking for
+                            </p>
+                            <ul className="mt-2 space-y-1.5">
+                              {job.requirements.map((item, idx) => (
+                                <li key={idx} className="flex gap-2 text-sm text-gray-700 leading-relaxed">
+                                  <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[#1668D9]" />
+                                  <span>{item}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {application ? (
+                          <div className="mt-4 flex flex-col gap-2 rounded-xl border border-slate-200 bg-white px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                            <p className="flex items-center gap-2 text-sm text-slate-600">
+                              <CheckCircle className="h-4 w-4 shrink-0 text-emerald-500" />
+                              <span>
+                                Applied {formatPHDate(application.appliedDate, "long")}
+                                {appliedTime(application.appliedDateTime)
+                                  ? ` · ${appliedTime(application.appliedDateTime)}`
+                                  : ""}
+                              </span>
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => setTab("applications")}
+                              className="inline-flex items-center justify-center gap-1 rounded-lg px-2 py-1 text-sm font-semibold text-[#1668D9] hover:bg-blue-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]"
+                            >
+                              View application
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="mt-4">
+                            <Button
+                              variant="primary"
+                              className="w-full h-11 text-sm sm:w-auto"
+                              onClick={() => navigate(`/customer/job-apply/${job.id}`)}
+                            >
+                              Apply for this Position
+                            </Button>
+                          </div>
+                        )}
+                      </div>
                     </div>
-                  )}
+                  </div>
                 </Card>
               );
             })}
           </div>
+          </>
         )}
 
-        {/* ── MY APPLICATIONS ── */}
+        {/* -- MY APPLICATIONS -- */}
         {tab === 'applications' && (
-          <div className="space-y-5">
+          <>
+          {hydrating && <CardSkeleton cards={2} columns={1} label="Loading your applications" />}
+          <div className={hydrating ? "hidden" : "space-y-3"}>
             {applications.length === 0 ? (
               <Card className="p-16 bg-white shadow-sm text-center border border-gray-100">
                 <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
                   <Briefcase className="w-8 h-8 text-gray-300" />
                 </div>
                 <p className="font-semibold text-gray-500 text-lg">No applications yet</p>
-                <p className="text-sm text-gray-400 mt-1">Browse job listings and apply to get started.</p>
+                <p className="text-sm text-gray-500 mt-1">Browse job listings and apply to get started.</p>
                 <Button
-                  className="mt-6 bg-[#1D73EC] hover:bg-[#10316B] text-white"
+                  variant="outline"
+                  className="mt-6 w-fit mx-auto px-3"
                   onClick={() => setTab('listings')}
                 >
                   Browse Listings
@@ -279,54 +380,54 @@ export default function JobBoard() {
                 const job = jobs.find((j) => j.id === app.jobId);
 
                 return (
-                  <Card key={app.id} className="overflow-hidden bg-white shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
-                    <div className="p-6">
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="flex items-start gap-4">
-                          <div className="w-12 h-12 bg-[#F2F7FF] rounded-xl flex items-center justify-center flex-shrink-0 border border-blue-100">
-                            <Briefcase className="w-6 h-6 text-[#1D73EC]" />
+<Card key={app.id} className="overflow-hidden border border-gray-100 bg-white shadow-sm transition-shadow hover:shadow-md">
+                    <div className="p-4 sm:p-6">
+                      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                        <div className="flex items-start gap-3 sm:gap-4">
+                          <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-blue-100 bg-[#F2F7FF]">
+                            <Briefcase className="h-6 w-6 text-[#1668D9]" />
                           </div>
-                          <div>
-                            <h3 className="text-lg font-bold text-[#1c1f26]">{app.jobTitle}</h3>
-                            <p className="text-sm text-gray-500 mt-0.5">
-                              Applied on {new Date(app.appliedDate).toLocaleDateString('en-PH', { year: 'numeric', month: 'long', day: 'numeric' })}
+                          <div className="min-w-0">
+                            <h3 className="text-base font-bold text-[#1c1f26] sm:text-lg">{app.jobTitle}</h3>
+                            <p className="mt-0.5 text-sm text-gray-500">
+                              Applied on {formatPHDate(app.appliedDate, "long")}
+                              {appliedTime(app.appliedDateTime) ? ` · ${appliedTime(app.appliedDateTime)}` : ""}
                             </p>
-                            <div className="flex items-center gap-2 mt-2">
-                              <Badge className={`text-xs border ${STATUS_COLORS[app.status]}`}>
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                              <Badge className={`text-xs border ${applicationStatusStyle(app.status).badge}`}>
                                 {app.status}
                               </Badge>
-                              <span className="text-xs text-gray-400">{app.id}</span>
+                              <span className="text-xs text-gray-500">{applicationDisplayId(app.id)}</span>
                             </div>
                           </div>
                         </div>
 
-                        {/* View Full Details Button */}
                         <Button
                           variant="outline"
                           size="sm"
-                          className="text-xs border-[#1D73EC] text-[#1D73EC] hover:bg-[#1D73EC] hover:text-white flex-shrink-0"
+                          className="w-full text-xs sm:w-auto"
                           onClick={() => setSelectedApp(app)}
                         >
-                          <Eye className="w-3.5 h-3.5 mr-1.5" />
+                          <Eye className="mr-1.5 h-3.5 w-3.5" />
                           View Details
                         </Button>
                       </div>
 
                       {/* Interview Banner */}
                       {app.status === 'For Interview' && app.interviewDate && (
-                        <div className="mt-4 p-4 bg-purple-50 border border-purple-200 rounded-xl">
+                        <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-xl">
                           <div className="flex items-center gap-2 mb-2">
-                            <Calendar className="w-4 h-4 text-purple-600" />
-                            <span className="font-semibold text-purple-900 text-sm">Interview Scheduled</span>
+                            <Calendar className="w-4 h-4 text-blue-600" />
+                            <span className="font-semibold text-blue-900 text-sm">Interview Scheduled</span>
                           </div>
-                          <div className="grid grid-cols-2 gap-3 text-sm text-purple-800">
+                          <div className="grid grid-cols-2 gap-3 text-sm text-blue-800">
                             <div>
                               <span className="font-medium">Date: </span>
-                              {new Date(app.interviewDate).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                              {formatPHDate(app.interviewDate, "long")}
                             </div>
                             <div>
                               <span className="font-medium">Time: </span>
-                              {app.interviewTime}
+                              {formatClockTime(app.interviewTime)}
                             </div>
                             <div className="col-span-2">
                               <span className="font-medium">Location: </span>
@@ -337,25 +438,25 @@ export default function JobBoard() {
                       )}
 
                       {app.status === 'Under Review' && (
-                        <div className="mt-4 p-4 bg-white border-2 border-blue-200 border border-green-200 rounded-xl flex items-start gap-3">
-                          <Info className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
-                          <p className="text-sm text-blue-900">
+                        <div className="mt-4 p-4 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-3">
+                          <Info className="w-4 h-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                          <p className="text-sm text-amber-900">
                             Your application is currently being reviewed by our team. We'll notify you of any updates soon.
                           </p>
                         </div>
                       )}
 
                       {app.status === 'Approved' && (
-                        <div className="mt-4 p-4 bg-white border-2 border-blue-200 border border-green-200 rounded-xl flex items-start gap-3">
-                          <CheckCircle className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
-                          <p className="text-sm text-blue-900 font-medium">
+                        <div className="mt-4 p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-3">
+                          <CheckCircle className="w-4 h-4 text-emerald-600 mt-0.5 flex-shrink-0" />
+                          <p className="text-sm text-emerald-900 font-medium">
                             Congratulations! Your application has been approved. We'll contact you soon with next steps.
                           </p>
                         </div>
                       )}
 
                       {app.status === 'Rejected' && (
-                        <div className="mt-4 p-4 bg-white border-2 border-blue-200 border border-green-200 rounded-xl">
+                        <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-xl">
                           <p className="text-sm text-red-900">
                             We appreciate your interest. Unfortunately, we've decided to move forward with other candidates at this time.
                           </p>
@@ -367,14 +468,15 @@ export default function JobBoard() {
               })
             )}
           </div>
+          </>
         )}
 
         {/* Info Card */}
-        <Card className="p-6 bg-[#F2F7FF] border border-green-200">
+        <Card className="border border-gray-200 bg-gray-50 p-4 sm:p-6">
           <div className="flex items-start gap-3">
-            <Briefcase className="w-5 h-5 text-[#1D73EC] mt-0.5 flex-shrink-0" />
+            <Briefcase className="mt-0.5 h-5 w-5 shrink-0 text-gray-500" />
             <div>
-              <h3 className="font-semibold text-[#10316B] mb-2">Why Work With DocuFy?</h3>
+              <h3 className="mb-2 font-semibold text-[#10316B]">Why Work With Docufy?</h3>
               <ul className="space-y-1 text-sm text-gray-700">
                 <li>• Flexible schedules perfect for students</li>
                 <li>• Gain valuable work experience in printing & admin</li>
@@ -386,7 +488,7 @@ export default function JobBoard() {
         </Card>
       </div>
 
-      {/* ── FULL APPLICATION DETAILS MODAL ── */}
+      {/* -- FULL APPLICATION DETAILS MODAL -- */}
       <Dialog open={!!selectedApp} onOpenChange={() => setSelectedApp(null)}>
         <DialogContent className="sm:max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader className="pb-2">
@@ -402,15 +504,22 @@ export default function JobBoard() {
           {selectedApp && (
             <div className="space-y-5 pt-2">
 
-              {/* Status + ID Row */}
-              <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl border border-gray-100">
-                <div>
-                  <p className="text-xs text-gray-500 font-medium">Application ID</p>
-                  <p className="font-bold text-gray-900 font-mono">{selectedApp.id}</p>
+              {/* Applicant + status */}
+              <div className="flex items-start justify-between gap-3 rounded-xl border border-gray-100 bg-gray-50 p-4">
+                <div className="flex min-w-0 items-center gap-3">
+                  <PersonAvatar
+                    name={selectedApp.name}
+                    src={selectedApp.applicantPhotoUrl ?? selectedApp.applicantProfileImage}
+                    className="h-12 w-12 text-sm"
+                  />
+                  <div className="min-w-0">
+                    <p className="truncate font-semibold text-gray-900">{selectedApp.name}</p>
+                    <p className="font-mono text-xs text-gray-500">{applicationDisplayId(selectedApp.id)}</p>
+                  </div>
                 </div>
-                <div className="text-right">
-                  <p className="text-xs text-gray-500 font-medium mb-1">Status</p>
-                  <Badge className={`text-sm border ${STATUS_COLORS[selectedApp.status]}`}>
+                <div className="shrink-0 text-right">
+                  <p className="mb-1 text-xs font-medium text-gray-500">Status</p>
+                  <Badge className={`border text-sm ${applicationStatusStyle(selectedApp.status).badge}`}>
                     {selectedApp.status}
                   </Badge>
                 </div>
@@ -447,9 +556,10 @@ export default function JobBoard() {
                   </p>
                 </div>
                 <div className="p-4">
-                  <p className="font-bold text-[#1D73EC] text-base">{selectedApp.position}</p>
+                  <p className="font-bold text-[#1668D9] text-base">{selectedApp.position}</p>
                   <p className="text-xs text-gray-500 mt-0.5">
-                    Submitted on {new Date(selectedApp.appliedDate).toLocaleDateString('en-PH', { year: 'numeric', month: 'long', day: 'numeric' })}
+                    Submitted on {formatPHDate(selectedApp.appliedDate, "long")}
+                    {appliedTime(selectedApp.appliedDateTime) ? ` · ${appliedTime(selectedApp.appliedDateTime)}` : ""}
                   </p>
                 </div>
               </div>
@@ -476,21 +586,34 @@ export default function JobBoard() {
                   </div>
                   <div className="p-4">
                     {selectedApp.portfolioType === 'file' ? (
-                      <div className="flex items-center gap-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
-                        <FileText className="w-5 h-5 text-blue-600" />
-                        <div className="flex-1">
-                          <p className="text-sm font-medium text-gray-900">
-                            {selectedApp.portfolioFileName || 'Uploaded File'}
-                          </p>
-                          <p className="text-xs text-gray-500">PDF/Image Upload</p>
+                      <div className="flex flex-col gap-3">
+                        <div className="flex items-center gap-3 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                          <FileText className="w-5 h-5 text-blue-600" />
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-gray-900">
+                              {selectedApp.portfolioFileName || 'Uploaded File'}
+                            </p>
+                            <p className="text-xs text-gray-500">PDF/Image Upload</p>
+                          </div>
                         </div>
+                        {selectedApp.portfolioStoragePath || selectedApp.portfolioFile ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="w-full"
+                            onClick={() => void openApplicationPortfolio(selectedApp)}
+                          >
+                            <Eye className="mr-1.5 h-4 w-4" />
+                            View
+                          </Button>
+                        ) : null}
                       </div>
                     ) : (
                       <a
                         href={selectedApp.portfolio}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="inline-flex items-center gap-2 text-sm font-medium text-[#1D73EC] hover:text-[#10316B] hover:underline transition-colors break-all"
+                        className="inline-flex items-center gap-2 text-sm font-medium text-[#1668D9] hover:text-[#10316B] hover:underline transition-colors break-all"
                       >
                         <ExternalLink className="w-4 h-4 flex-shrink-0" />
                         {selectedApp.portfolio}
@@ -500,31 +623,31 @@ export default function JobBoard() {
                 </div>
               ) : (
                 <div className="rounded-xl border border-dashed border-gray-200 p-4 text-center">
-                  <p className="text-xs text-gray-400">No portfolio provided</p>
+                  <p className="text-xs text-gray-500">No portfolio provided</p>
                 </div>
               )}
 
               {/* Interview Details if applicable */}
               {selectedApp.status === 'For Interview' && selectedApp.interviewDate && (
-                <div className="rounded-xl border border-purple-200 bg-purple-50 overflow-hidden">
-                  <div className="px-4 py-3 border-b border-purple-200">
-                    <p className="text-xs font-semibold text-purple-900 uppercase tracking-wider flex items-center gap-1.5">
+                <div className="rounded-xl border border-blue-200 bg-blue-50 overflow-hidden">
+                  <div className="px-4 py-3 border-b border-blue-200">
+                    <p className="text-xs font-semibold text-blue-900 uppercase tracking-wider flex items-center gap-1.5">
                       <Calendar className="w-3.5 h-3.5" /> Interview Schedule
                     </p>
                   </div>
-                  <div className="p-4 grid grid-cols-2 gap-4 text-sm text-purple-900">
+                  <div className="p-4 grid grid-cols-2 gap-4 text-sm text-blue-900">
                     <div>
-                      <p className="text-xs text-purple-600 mb-0.5">Date</p>
+                      <p className="text-xs text-blue-600 mb-0.5">Date</p>
                       <p className="font-semibold">
-                        {new Date(selectedApp.interviewDate).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                        {formatPHDate(selectedApp.interviewDate, "long")}
                       </p>
                     </div>
                     <div>
-                      <p className="text-xs text-purple-600 mb-0.5">Time</p>
-                      <p className="font-semibold">{selectedApp.interviewTime}</p>
+                      <p className="text-xs text-blue-600 mb-0.5">Time</p>
+                      <p className="font-semibold">{formatClockTime(selectedApp.interviewTime)}</p>
                     </div>
                     <div className="col-span-2">
-                      <p className="text-xs text-purple-600 mb-0.5">Location</p>
+                      <p className="text-xs text-blue-600 mb-0.5">Location</p>
                       <p className="font-semibold">{selectedApp.interviewLocation}</p>
                     </div>
                   </div>
@@ -574,11 +697,12 @@ export default function JobBoard() {
           </DialogHeader>
           <div className="flex flex-col gap-2 mt-4">
             <Button
+              variant="primary"
               onClick={() => {
                 setShowSuccessDialog(false);
                 setTab('applications');
               }}
-              className="w-full bg-[#1D73EC] hover:bg-[#10316B]"
+              className="w-full"
             >
               View My Applications
             </Button>

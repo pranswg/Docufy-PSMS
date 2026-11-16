@@ -1,0 +1,617 @@
+// "Unclaimed Order History" — Admin/Staff detail page listing every
+// automatically DERIVED late-pickup record: an order that reached pickup, still
+// owed money at its pickup deadline (the shop's configured closing time), and
+// was collected AFTER that deadline. Fully paid orders never appear (they are
+// not financial offences), and orders still uncollected live on the Unclaimed
+// Orders page. Reached only from the Unclaimed Orders card, never the sidebar.
+//
+// There is no manual review, excuse, or confirm workflow here: a record exists
+// only when the real order + status-history + payment timeline proves it.
+// Display-only — nothing is enforced or written.
+
+import React, { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router";
+import {
+  Search,
+  Eye,
+  ClipboardList,
+  AlertTriangle,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Users,
+  Banknote,
+  ArrowLeft,
+} from "lucide-react";
+import Layout from "../Layout";
+import StaffTimeInGate from "./StaffTimeInGate";
+import { Card } from "../ui/card";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { Input } from "../ui/input";
+import { Label } from "../ui/label";
+import { SummaryCard } from "../ui/summary-card";
+import { DateRangeFilter } from "../ui/date-range-filter";
+import { TableSkeleton } from "../ui/table-skeleton";
+import { CopyFieldButton } from "../ui/copy-field-button";
+import { useHydrating } from "../../utils/useHydrating";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "../ui/dialog";
+import { formatPHDate, formatPHTime, formatPHDateTime } from "../../utils/pht";
+import { formatCurrency } from "../../utils/formatNumber";
+import { getStatusBadgeClasses } from "../../utils/orderStatusPalette";
+import {
+  isClosingTimeConfigured,
+  type UnclaimedRecord,
+} from "../../utils/unclaimedOrders";
+import { useUnclaimedAdminData } from "../../utils/useUnclaimedOffenses";
+
+interface UnclaimedOrderHistoryProps {
+  menuItems: Array<{ label: string; path: string; icon: React.ReactNode }>;
+  userRole: "admin" | "staff";
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  inQueue: "In Queue",
+  printing: "Printing",
+  completed: "Completed",
+  released: "Picked Up",
+  canceled: "Canceled",
+  awaitingPayment: "Awaiting Payment",
+};
+
+const statusLabel = (status: string) => STATUS_LABELS[status] ?? status;
+
+const PAGE_SIZE = 10;
+
+/** Human-readable "how late" between the deadline and the late collection. */
+function formatLateBy(releasedAt: Date, deadlineAt: Date): string {
+  const ms = releasedAt.getTime() - deadlineAt.getTime();
+  if (ms <= 0) return "—";
+  const minutes = Math.floor(ms / 60000);
+  const days = Math.floor(minutes / 1440);
+  const hours = Math.floor((minutes % 1440) / 60);
+  const mins = minutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${Math.max(1, mins)}m`;
+}
+
+export default function UnclaimedOrderHistory({
+  menuItems,
+  userRole,
+}: UnclaimedOrderHistoryProps) {
+  const hydrating = useHydrating();
+  const navigate = useNavigate();
+  const { closingTime, latePickups, ordersById, historyUnavailable } =
+    useUnclaimedAdminData();
+
+  const base =
+    userRole === "admin" ? "/admin/orders/unclaimed" : "/staff/queue/unclaimed";
+
+  const [search, setSearch] = useState("");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [currentPage, setCurrentPage] = useState(1);
+  const [selectedRecord, setSelectedRecord] = useState<UnclaimedRecord | null>(
+    null,
+  );
+
+  const filteredRecords = useMemo(() => {
+    let rows = [...latePickups].sort(
+      (a, b) => b.deadlineAt.getTime() - a.deadlineAt.getTime(),
+    );
+    const q = search.trim().toLowerCase();
+    if (q) {
+      rows = rows.filter((r) => {
+        const displayId =
+          ordersById.get(r.orderId)?.displayId ?? r.displayId ?? r.orderId;
+        return `${r.customerName} ${r.customerEmail} ${displayId}`
+          .toLowerCase()
+          .includes(q);
+      });
+    }
+    if (dateFrom) {
+      const from = new Date(`${dateFrom}T00:00:00`).getTime();
+      rows = rows.filter((r) => r.deadlineAt.getTime() >= from);
+    }
+    if (dateTo) {
+      const to = new Date(`${dateTo}T23:59:59.999`).getTime();
+      rows = rows.filter((r) => r.deadlineAt.getTime() <= to);
+    }
+    return rows;
+  }, [latePickups, ordersById, search, dateFrom, dateTo]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [search, dateFrom, dateTo]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredRecords.length / PAGE_SIZE));
+  const pageRows = filteredRecords.slice(
+    (currentPage - 1) * PAGE_SIZE,
+    currentPage * PAGE_SIZE,
+  );
+
+  const lateCustomerCount = new Set(
+    latePickups.map((r) => r.customerKey.trim().toLowerCase()),
+  ).size;
+  const owedAtDeadline = latePickups.reduce(
+    (sum, r) => sum + (r.balance ?? 0),
+    0,
+  );
+
+  return (
+    <Layout
+      menuItems={menuItems}
+      title="Late Pick-up History"
+      showBackButton
+      backButtonPath={base}
+    >
+      <StaffTimeInGate>
+        <div className="flex flex-col space-y-6">
+          {/* Desktop has no header back arrow, so the way out of this detail
+              page is stated here in the same outline button the other
+              drill-down pages (Job Board, Staff) use; below md the header
+              arrow already returns to Unclaimed Orders. */}
+          <div className="hidden md:block">
+            <Button
+              variant="outline"
+              onClick={() => navigate(base)}
+              className="shrink-0"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back to Unclaimed Orders
+            </Button>
+          </div>
+
+          {/* Same summary row the All Orders workspace opens with. */}
+          <div className="grid grid-cols-1 @min-[560px]:grid-cols-3 gap-2 sm:gap-3 mb-4 shrink-0">
+            <SummaryCard
+              label="Late pick-ups"
+              value={latePickups.length}
+              icon={ClipboardList}
+              iconColor="text-[#2F6FD6]"
+              labelColor="text-[#1668D9]"
+            />
+            <SummaryCard
+              label="Customers"
+              value={lateCustomerCount}
+              icon={Users}
+              iconColor="text-[#2F6FD6]"
+              labelColor="text-[#1668D9]"
+            />
+            <SummaryCard
+              label="Owed at deadline"
+              value={formatCurrency(owedAtDeadline)}
+              valueClassName="text-lg sm:text-xl font-semibold text-[#B91C1C]"
+              icon={Banknote}
+              iconColor="text-[#B91C1C]"
+              labelColor="text-[#B91C1C]"
+            />
+          </div>
+
+          {!isClosingTimeConfigured(closingTime) && (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-600" />
+              <span>
+                Unclaimed orders cannot be computed yet — set the shop closing
+                time in Admin → Landing Page → Shop Information.
+              </span>
+            </div>
+          )}
+
+          {historyUnavailable && (
+            <div className="flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+              <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0 text-slate-500" />
+              <span>
+                Order status history could not be read, so this list may be incomplete.
+              </span>
+            </div>
+          )}
+
+          <Card className="p-4 border border-slate-100 shadow-sm mb-6 shrink-0">
+            <div className="flex flex-col lg:flex-row lg:items-end gap-4">
+              <div className="flex-1 min-w-[200px]">
+                <Label className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                  Search
+                </Label>
+                <div className="group relative mt-1.5">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#98A2B3] transition-colors group-focus-within:text-[#2F6FD6]" />
+                  <Input
+                    aria-label="Search unclaimed order history"
+                    placeholder="Search customer or order ID..."
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    className="pl-10"
+                  />
+                </div>
+              </div>
+              <DateRangeFilter
+                value={{ from: dateFrom, to: dateTo }}
+                onChange={(next) => {
+                  setDateFrom(next.from);
+                  setDateTo(next.to);
+                }}
+                fromLabel="From"
+                toLabel="To"
+                className="w-full lg:w-[21rem]"
+              />
+            </div>
+            <p className="mt-2 text-xs text-gray-500">
+              Date range filters by the day an order became unclaimed (its missed
+              pickup deadline).
+            </p>
+          </Card>
+
+          <Card className="overflow-hidden">
+            {hydrating && <TableSkeleton columns={10} rows={8} />}
+            {!hydrating && (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead className="bg-[#F2F7FF] border-b border-[#1668D9]/10">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-xs font-semibold text-[#10316B] uppercase tracking-wider w-14 whitespace-nowrap">
+                        #
+                      </th>
+                      {[
+                        "Customer",
+                        "Order ID",
+                        "Status",
+                        "Owed",
+                        "Ready",
+                        "Deadline",
+                        "Collected",
+                        "Late by",
+                        "Action",
+                      ].map((h) => (
+                        <th
+                          key={h}
+                          className="px-4 py-3 text-left text-xs font-semibold text-[#10316B] uppercase tracking-wider whitespace-nowrap"
+                        >
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="bg-white">
+                    {filteredRecords.length === 0 ? (
+                      <tr>
+                        <td colSpan={10} className="px-4 py-14">
+                          <div className="flex flex-col items-center text-center">
+                            <span className="flex h-12 w-12 items-center justify-center rounded-full bg-white text-[#1668D9] ring-1 ring-[#1668D9]/15">
+                              <ClipboardList className="h-6 w-6" />
+                            </span>
+                            <p className="mt-3 text-sm font-semibold text-gray-800">
+                              No late pickups yet
+                            </p>
+                            <p className="mt-1 max-w-md text-xs text-gray-500">
+                              An order appears here once it is collected after a
+                              pickup deadline it had still owed money at.
+                            </p>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : (
+                      pageRows.map((record, index) => {
+                        const order = ordersById.get(record.orderId);
+                        const listPosition =
+                          (currentPage - 1) * PAGE_SIZE + index + 1;
+                        return (
+                          <tr
+                            key={record.orderId}
+                            className="border-b border-gray-100 last:border-0 hover:bg-gray-50 transition-colors cursor-pointer"
+                            onClick={() => setSelectedRecord(record)}
+                          >
+                            <td className="px-4 py-3 text-sm font-semibold text-[#10316B]">
+                              {listPosition}
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="text-sm font-semibold text-gray-900">
+                                {record.customerName}
+                              </div>
+                              <div className="flex items-center gap-1.5 text-xs text-gray-500">
+                                <span className="min-w-0">
+                                  {record.customerEmail || "—"}
+                                </span>
+                                <CopyFieldButton
+                                  value={record.customerEmail}
+                                  label="customer email"
+                                />
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <span className="font-mono text-xs text-gray-700">
+                                {order?.displayId ?? record.displayId ?? record.orderId}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              {order ? (
+                                <Badge
+                                  variant="outline"
+                                  className={`text-xs font-medium ${getStatusBadgeClasses(
+                                    order.status,
+                                  )}`}
+                                >
+                                  {statusLabel(order.status)}
+                                </Badge>
+                              ) : record.releasedAt ? (
+                                <Badge
+                                  variant="outline"
+                                  className={`text-xs font-medium ${getStatusBadgeClasses(
+                                    "Released",
+                                  )}`}
+                                >
+                                  Released
+                                </Badge>
+                              ) : (
+                                <span className="text-xs text-gray-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3">
+                              {record.balance != null ? (
+                                <>
+                                  <div className="text-sm font-semibold text-red-700">
+                                    {formatCurrency(record.balance)}
+                                  </div>
+                                  <div className="text-xs text-gray-500">
+                                    {record.amountPaid && record.amountPaid > 0
+                                      ? `${formatCurrency(record.amountPaid)} paid by deadline`
+                                      : "Nothing paid by deadline"}
+                                  </div>
+                                </>
+                              ) : (
+                                <span className="text-xs text-gray-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3">
+                              <div className="text-xs text-gray-700">
+                                {formatPHDate(record.readyAt)}
+                              </div>
+                              <div className="text-xs text-gray-500">
+                                {formatPHTime(record.readyAt)}
+                              </div>
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <span className="text-xs font-medium text-red-700">
+                                {formatPHDateTime(record.deadlineAt)}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              {record.releasedAt ? (
+                                <span className="inline-flex items-center gap-1.5 text-xs text-gray-600">
+                                  <CheckCircle2 className="h-3.5 w-3.5 text-[#2F6FD6]" />
+                                  {formatPHDate(record.releasedAt)}
+                                </span>
+                              ) : (
+                                <span className="text-xs text-gray-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <span className="text-xs font-semibold text-amber-700">
+                                {record.releasedAt
+                                  ? formatLateBy(
+                                      record.releasedAt,
+                                      record.deadlineAt,
+                                    )
+                                  : "—"}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedRecord(record);
+                                }}
+                                className="h-8"
+                              >
+                                <Eye className="h-3.5 w-3.5" />
+                                View
+                              </Button>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Pagination */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-5 py-4 border-t border-gray-100 bg-white">
+              <p className="text-sm text-slate-500">
+                Showing{" "}
+                <span className="font-semibold text-slate-700">
+                  {totalPages === 1
+                    ? filteredRecords.length
+                    : `${(currentPage - 1) * PAGE_SIZE + 1}–${Math.min(
+                        currentPage * PAGE_SIZE,
+                        filteredRecords.length,
+                      )}`}
+                </span>{" "}
+                of{" "}
+                <span className="font-semibold text-slate-700">
+                  {filteredRecords.length}
+                </span>{" "}
+                late pick-up{filteredRecords.length === 1 ? "" : "s"}
+              </p>
+              {totalPages > 1 && (
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={currentPage === 1}
+                    onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                    className="h-9 px-3"
+                  >
+                    <ChevronLeft className="h-4 w-4" /> Previous
+                  </Button>
+                  {Array.from({ length: totalPages }, (_, i) => i + 1).map(
+                    (pg) => (
+                      <Button
+                        key={pg}
+                        type="button"
+                        variant={pg === currentPage ? "primary" : "outline"}
+                        size="icon"
+                        onClick={() => setCurrentPage(pg)}
+                      >
+                        {pg}
+                      </Button>
+                    ),
+                  )}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={currentPage === totalPages}
+                    onClick={() =>
+                      setCurrentPage((p) => Math.min(totalPages, p + 1))
+                    }
+                    className="h-9 px-3"
+                  >
+                    Next <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              )}
+            </div>
+          </Card>
+        </div>
+      </StaffTimeInGate>
+
+      {/* Late pickup details */}
+      <Dialog
+        open={!!selectedRecord}
+        onOpenChange={(open) => {
+          if (!open) setSelectedRecord(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-[680px] max-h-[90vh] overflow-y-auto p-[26px]">
+          {selectedRecord && (
+            <>
+              <DialogHeader className="border-b border-gray-100 pb-4">
+                <div className="flex flex-wrap items-start justify-between gap-3 pr-8">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <DialogTitle className="text-[22px] font-bold text-[#10316B]">
+                        {selectedRecord.customerName}
+                      </DialogTitle>
+                      <span className="font-mono text-sm text-gray-500">
+                        {ordersById.get(selectedRecord.orderId)?.displayId ??
+                          selectedRecord.displayId ??
+                          selectedRecord.orderId}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex items-center gap-1.5">
+                      <DialogDescription className="min-w-0 text-sm text-gray-500">
+                        {selectedRecord.customerEmail || "No email on file"}
+                      </DialogDescription>
+                      <CopyFieldButton
+                        value={selectedRecord.customerEmail}
+                        label="customer email"
+                      />
+                    </div>
+                  </div>
+                  {ordersById.get(selectedRecord.orderId) || selectedRecord.releasedAt ? (
+                    <Badge
+                      variant="outline"
+                      className={`text-xs font-medium ${getStatusBadgeClasses(
+                        ordersById.get(selectedRecord.orderId)?.status ?? "Released",
+                      )}`}
+                    >
+                      {statusLabel(
+                        ordersById.get(selectedRecord.orderId)?.status ?? "Released",
+                      )}
+                    </Badge>
+                  ) : null}
+                </div>
+              </DialogHeader>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Ready for Pickup
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-gray-900">
+                    {formatPHDate(selectedRecord.readyAt)} ·{" "}
+                    {formatPHTime(selectedRecord.readyAt)}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-red-200 bg-red-50 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-red-700">
+                    Pickup Deadline
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-red-800">
+                    {formatPHDateTime(selectedRecord.deadlineAt)}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Collected
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-gray-900">
+                    {selectedRecord.releasedAt
+                      ? `${formatPHDate(selectedRecord.releasedAt)} · ${formatPHTime(
+                          selectedRecord.releasedAt,
+                        )}`
+                      : "Not collected"}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-700">
+                    Late By
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-amber-800">
+                    {selectedRecord.releasedAt
+                      ? formatLateBy(
+                          selectedRecord.releasedAt,
+                          selectedRecord.deadlineAt,
+                        )
+                      : "—"}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Owed at Deadline
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-red-700">
+                    {selectedRecord.balance != null
+                      ? formatCurrency(selectedRecord.balance)
+                      : "—"}
+                  </p>
+                  <p className="mt-0.5 text-xs text-gray-500">
+                    {selectedRecord.amountPaid && selectedRecord.amountPaid > 0
+                      ? `${formatCurrency(selectedRecord.amountPaid)} paid by then`
+                      : "Nothing paid by then"}
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-200 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Order Total
+                  </p>
+                  <p className="mt-1 text-sm font-semibold text-gray-900">
+                    {selectedRecord.orderTotal != null
+                      ? formatCurrency(selectedRecord.orderTotal)
+                      : "—"}
+                  </p>
+                </div>
+              </div>
+
+              <p className="text-xs text-gray-500">
+                Not collected by its pickup deadline, then collected afterwards
+                {selectedRecord.balance != null
+                  ? ` — ${formatCurrency(selectedRecord.balance)} was still owed at that deadline.`
+                  : "."}
+              </p>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </Layout>
+  );
+}

@@ -1,15 +1,19 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router';
-import { LayoutDashboard, FileText, Briefcase, Package, User, Mail, Phone, ArrowLeft, CheckCircle, AlertCircle, Key, Shield } from 'lucide-react';
+import { LayoutDashboard, FileText, Briefcase, Package, User, Mail, Phone, ArrowLeft, AlertCircle, Key, Camera, ChevronRight, Lock, LogOut, Pencil, CheckCircle, Eye, EyeOff } from 'lucide-react';
 import { toast } from 'sonner';
+import { AvatarCropDialog } from '../ui/avatar-crop-dialog';
 import Layout from '../Layout';
 import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { Input } from '../ui/input';
 import { Label } from '../ui/label';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '../ui/dialog';
-import { useAuth } from '../../contexts/AuthContext';
+import { ConfirmationDialog } from '../ui/confirmation-dialog';
+import { useAuth, type User as AuthUser } from '../../contexts/AuthContext';
 import { PasswordStrengthIndicator, validatePassword } from '../ui/password-strength-indicator';
+import { isDataUrl } from '../../utils/supabaseAvatar';
+import type { Database } from '../../../lib/database.types';
 
 const menuItems = [
   { label: 'Dashboard', path: '/customer/dashboard', icon: <LayoutDashboard className="w-5 h-5" /> },
@@ -18,123 +22,222 @@ const menuItems = [
   { label: 'Job Board', path: '/customer/job-board', icon: <Briefcase className="w-5 h-5" /> },
 ];
 
-const STORAGE_KEY = 'customer_profile_data';
+// Profile data (name/phone) is stored PER ACCOUNT so a customer who
+// signs out cannot leave their details behind for the next person on the same
+// browser. The legacy shared key is adopted ONLY when it embeds the signed-in
+// account's own email — otherwise it is ignored (leak-safe migration).
+// Profile PICTURES are never stored locally — they live only in Supabase
+// (profiles.profile_image_path), and legacy localStorage avatar keys are
+// purged at boot (see supabaseAvatar.purgeLocalAvatarKeys).
+const LEGACY_PROFILE_KEY = 'customer_profile_data';
+const PROFILE_KEY_PREFIX = 'customer_profile_data_v2';
 
-const defaultProfileData = {
-  firstName: '',
-  lastName: '',
-  email: '',
-  phone: '0912 345 6789',
-  studentId: 'STU-2024-001',
-};
+function accountKeyFor(user: AuthUser | null): string {
+  if (!user) return 'unknown';
+  if (user.id) return user.id;
+  return user.email ? user.email.trim().toLowerCase() : 'unknown';
+}
+
+function profileStorageKey(user: AuthUser | null): string {
+  return `${PROFILE_KEY_PREFIX}:${accountKeyFor(user)}`;
+}
+
+/** Reads the signed-in account's saved profile from its per-account key,
+ * adopting the legacy shared blob only when it is attributable to THIS account
+ * (its embedded email matches). Any other blob is left untouched so one
+ * customer's data can never surface for another. Returns null when there is
+ * nothing to show for the current account. */
+function readSavedProfile(
+  user: AuthUser | null,
+): { firstName?: string; lastName?: string; email?: string; phone?: string } | null {
+  if (!user) return null;
+
+  try {
+    const raw = localStorage.getItem(profileStorageKey(user));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') return parsed;
+    }
+  } catch {
+    // ignore storage failures — fall through to legacy
+  }
+
+  try {
+    const raw = localStorage.getItem(LEGACY_PROFILE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    const embedded =
+      typeof parsed.email === 'string' ? parsed.email.trim().toLowerCase() : '';
+    if (!embedded || embedded !== user.email?.trim().toLowerCase()) return null;
+
+    // Adopt into the per-account key, then retire the legacy key so no later
+    // account can be misattributed. (The legacy picture, if any, is NOT touched
+    // here — avatars are Supabase-only, and legacy avatar keys were purged at boot.)
+    try {
+      localStorage.setItem(profileStorageKey(user), raw);
+      localStorage.removeItem(LEGACY_PROFILE_KEY);
+    } catch {
+      // storage unavailable — legacy stays, but the form still renders
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function buildFormData(
+  user: AuthUser | null,
+  saved: { firstName?: string; lastName?: string; email?: string; phone?: string } | null,
+) {
+  const nameParts = (user?.name || '').split(' ');
+  const defaultFirstName = nameParts[0] || '';
+  const defaultLastName = nameParts.slice(1).join(' ') || '';
+  return {
+    firstName: saved?.firstName || defaultFirstName,
+    lastName: saved?.lastName || defaultLastName,
+    email: user?.email || saved?.email || '',
+    phone: saved?.phone ?? user?.phone ?? '',
+  };
+}
+
+/** Scannable read-only row used in the profile VIEW state. */
+function InfoRow({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-3 py-3">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#F2F7FF] text-[#1668D9]">
+        {icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs font-medium text-gray-500">{label}</p>
+        <p className="mt-0.5 truncate text-sm font-semibold text-gray-900">{value || '—'}</p>
+      </div>
+    </div>
+  );
+}
+
+function SectionHeading({ children }: { children: React.ReactNode }) {
+  return (
+    <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-500">{children}</h2>
+  );
+}
 
 export default function CustomerProfile() {
   const navigate = useNavigate();
-  // Layout will be updated with showBackButton prop below
-  const { user, enableMFA, disableMFA, resetPassword } = useAuth();
-  const [showSavedMessage, setShowSavedMessage] = useState(false);
+  const { user, resetPassword, updateProfile, updateProfileImage, syncProfileDetails, logout } = useAuth();
   const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [showSuccessDialog, setShowSuccessDialog] = useState(false);
   const [showChangePasswordDialog, setShowChangePasswordDialog] = useState(false);
-  const [showMFADialog, setShowMFADialog] = useState(false);
-  const [mfaSecret, setMfaSecret] = useState('');
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [passwordData, setPasswordData] = useState({
-    currentPassword: '',
-    newPassword: '',
-    confirmPassword: '',
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: "",
   });
-  const [formData, setFormData] = useState(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    const nameParts = (user?.name || '').split(' ');
-    const defaultFirstName = nameParts[0] || '';
-    const defaultLastName = nameParts.slice(1).join(' ') || '';
-
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        // Handle migration from old 'name' field to firstName/lastName
-        if (parsed.name && !parsed.firstName && !parsed.lastName) {
-          const parts = parsed.name.split(' ');
-          return {
-            ...parsed,
-            firstName: parts[0] || defaultFirstName,
-            lastName: parts.slice(1).join(' ') || defaultLastName,
-            email: user?.email || parsed.email
-          };
-        }
-        return {
-          ...parsed,
-          firstName: parsed.firstName || defaultFirstName,
-          lastName: parsed.lastName || defaultLastName,
-          email: user?.email || parsed.email
-        };
-      } catch {
-        return {
-          ...defaultProfileData,
-          firstName: defaultFirstName,
-          lastName: defaultLastName,
-          email: user?.email || defaultProfileData.email
-        };
-      }
-    }
-    return {
-      ...defaultProfileData,
-      firstName: defaultFirstName,
-      lastName: defaultLastName,
-      email: user?.email || defaultProfileData.email
-    };
-  });
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const [formData, setFormData] = useState<{
+    firstName: string;
+    lastName: string;
+    email: string;
+    phone: string;
+  }>(() => buildFormData(user, readSavedProfile(user)));
   const [isEditing, setIsEditing] = useState(false);
+  const [profileImage, setProfileImage] = useState<string | null>(() =>
+    user?.profileImage ?? null,
+  );
 
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    const nameParts = (user?.name || '').split(' ');
-    const defaultFirstName = nameParts[0] || '';
-    const defaultLastName = nameParts.slice(1).join(' ') || '';
-
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        // Handle migration from old 'name' field to firstName/lastName
-        if (parsed.name && !parsed.firstName && !parsed.lastName) {
-          const parts = parsed.name.split(' ');
-          setFormData({
-            ...parsed,
-            firstName: parts[0] || defaultFirstName,
-            lastName: parts.slice(1).join(' ') || defaultLastName,
-            email: user?.email || parsed.email
-          });
-        } else {
-          setFormData({
-            ...parsed,
-            firstName: parsed.firstName || defaultFirstName,
-            lastName: parsed.lastName || defaultLastName,
-            email: user?.email || parsed.email
-          });
-        }
-      } catch {
-        setFormData({
-          ...defaultProfileData,
-          firstName: defaultFirstName,
-          lastName: defaultLastName,
-          email: user?.email || defaultProfileData.email
-        });
-      }
-    }
+    setFormData(buildFormData(user, readSavedProfile(user)));
   }, [user]);
+
+  useEffect(() => {
+    setProfileImage(user?.profileImage ?? null);
+  }, [user]);
+
+  const displayName = `${formData.firstName} ${formData.lastName}`.trim() || user?.name || 'Customer User';
+  const initials = displayName.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? '').join('') || 'U';
+
+  const [cropSource, setCropSource] = useState<string | null>(null);
+
+  const handleProfileImageChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // Reset first so picking the same file again still opens the editor (after
+    // a cancel, or after a rejected file).
+    event.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      toast.error('Please choose an image file.');
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      toast.error('Please choose an image smaller than 2MB.');
+      return;
+    }
+
+    // Read the file, then let the cropper decide the square. Nothing on the
+    // profile changes unless the user confirms it.
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : null;
+      if (result) setCropSource(result);
+    };
+    reader.readAsDataURL(file);
+  };
 
   const handleSave = () => {
     setShowSaveDialog(true);
   };
 
-  const confirmSave = () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(formData));
+  const confirmSave = async () => {
+    if (isSaving) return;
+    if (!user) {
+      setShowSaveDialog(false);
+      return;
+    }
+    setIsSaving(true);
+
+    // Text details (name/phone) write to the per-account blob
+    // regardless of the upload/backend result, so nothing is lost locally.
+    localStorage.setItem(profileStorageKey(user), JSON.stringify(formData));
+
+    // The picture is Supabase-ONLY: upload first, best-effort.
+    const pictureChanged = (profileImage ?? null) !== (user.profileImage ?? null);
+    let pictureError: string | null = null;
+    if (pictureChanged) {
+      const result = await updateProfileImage(profileImage ?? null);
+      if (!result.ok) pictureError = result.message;
+    }
+
+    // Push text details to the signed-in user's OWN profiles row. The email is
+    // excluded — it is the registered account email and is not editable.
+    const patch: Database['public']['Tables']['profiles']['Update'] = {
+      full_name: displayName,
+      phone: formData.phone.trim() || null,
+    };
+    const detailsResult = await syncProfileDetails(patch);
+    const detailsError = detailsResult.ok ? null : detailsResult.message;
+
+    updateProfile({ name: displayName });
+    setIsSaving(false);
+
+    if (detailsError || pictureError) {
+      const problems = [
+        detailsError ? `Your details weren't saved — ${detailsError}` : null,
+        pictureError ? `Your photo wasn't saved — ${pictureError}` : null,
+      ].filter(Boolean).join(' ');
+      toast.error(`Your changes were kept on this device. ${problems}`);
+      return;
+    }
+
     setIsEditing(false);
-    setShowSavedMessage(true);
     setShowSaveDialog(false);
-    setTimeout(() => setShowSavedMessage(false), 3000);
+    setShowSuccessDialog(true);
   };
 
-  const handleChangePassword = () => {
+  const handleChangePassword = async () => {
     console.log('Change password clicked');
 
     if (!passwordData.currentPassword || !passwordData.newPassword || !passwordData.confirmPassword) {
@@ -162,8 +265,17 @@ export default function CustomerProfile() {
 
     console.log('All validations passed, calling resetPassword');
 
-    // Use the resetPassword function from AuthContext (with user email)
-    if (user && resetPassword(user.email, passwordData.currentPassword, passwordData.newPassword)) {
+    if (!user) {
+      toast.error('You are signed out — sign in again to change your password.');
+      return;
+    }
+
+    const result = await resetPassword(
+      user.email,
+      passwordData.currentPassword,
+      passwordData.newPassword,
+    );
+    if (result.success) {
       console.log('Password reset successful');
       toast.success('Password changed successfully!');
       setShowChangePasswordDialog(false);
@@ -174,210 +286,231 @@ export default function CustomerProfile() {
       });
     } else {
       console.log('Password reset failed');
-      toast.error('Current password is incorrect or password was previously used');
+      toast.error(
+        result.reason === 'current_password'
+          ? 'Your current password is incorrect.'
+          : 'That new password was refused. Please choose a different one.',
+      );
     }
   };
 
-  const handleEnableMFA = () => {
-    const secret = enableMFA();
-    setMfaSecret(secret);
-    setShowMFADialog(true);
-  };
-
-  const handleDisableMFA = () => {
-    disableMFA();
-    toast.success('Multi-factor authentication disabled');
-  };
-
   return (
-    <Layout menuItems={menuItems} title="Profile Settings" showBackButton backButtonPath="/customer/dashboard">
-      <div className="max-w-3xl mx-auto space-y-8">
-        {/* Header */}
-        <div>
-          <h1 className="text-3xl font-semibold text-gray-900">Profile</h1>
-          <p className="text-gray-500 mt-1">Manage your account information</p>
+    <Layout menuItems={menuItems} title="Profile Settings" showBackButton backButtonPath="/customer/dashboard" hideMobileBackButton>
+      <div className="max-w-2xl mx-auto space-y-5 px-4 pb-12 sm:px-0">
+        {/* Back + page header (edit/view aware) */}
+        <div className="pt-2 md:pt-6">
+          <button
+            type="button"
+            onClick={() => navigate(-1)}
+            aria-label="Go back"
+            className="md:hidden inline-flex items-center gap-1 rounded-xl p-2 pl-0 text-gray-600 hover:bg-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]"
+          >
+            <ArrowLeft className="h-5 w-5" />
+            <span className="text-sm font-medium">Back</span>
+          </button>
+          <div className="mt-1 md:mt-6">
+            <h2 className="text-xl font-bold tracking-tight text-gray-900 sm:text-2xl">
+              {isEditing ? 'Edit Profile' : 'Profile'}
+            </h2>
+            <p className="mt-0.5 text-sm text-gray-500">
+              {isEditing ? 'Update your personal information' : 'Manage your account information'}
+            </p>
+          </div>
         </div>
 
-        {/* Success Message */}
-        {showSavedMessage && (
-          <div className="bg-white border-2 border-blue-200 rounded-xl p-4 flex items-center gap-3 animate-in fade-in slide-in-from-top-2 duration-300">
-            <CheckCircle className="w-5 h-5 text-blue-600" />
-            <p className="text-sm font-medium text-blue-900">Profile changes saved successfully!</p>
-          </div>
-        )}
-
-        {/* Profile Card */}
-        <Card className="p-8 bg-white shadow-sm">
-          <div className="flex items-start justify-between mb-8">
-            <div className="flex items-center gap-4">
-              <div className="w-20 h-20 bg-[#1D73EC] rounded-full flex items-center justify-center text-white text-2xl font-semibold">
-                {user?.name?.charAt(0) || 'U'}
+        {/* Profile Identity Card */}
+        <Card className="bg-white shadow-sm">
+          <div className="p-5">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+              <div className="flex min-w-0 flex-1 items-center gap-4">
+                <div className="flex shrink-0 flex-col items-start gap-1">
+                  <div className="relative flex h-16 w-16 items-center justify-center rounded-full bg-[#1668D9] text-lg font-semibold text-white ring-4 ring-white shadow-sm">
+                    {profileImage ? (
+                      <img src={profileImage} alt="Profile preview" className="h-full w-full rounded-full object-cover" />
+                    ) : (
+                      <span>{initials}</span>
+                    )}
+                    {isEditing && (
+                      <label className="absolute -bottom-1 -right-1 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-[#1668D9] text-white shadow-lg ring-2 ring-white">
+                        <Camera className="h-4 w-4" />
+                        <input type="file" accept="image/*" className="hidden" onChange={handleProfileImageChange} />
+                      </label>
+                    )}
+                  </div>
+                  {isEditing && profileImage && (
+                    <button
+                      type="button"
+                      onClick={() => setProfileImage(null)}
+                      className="whitespace-nowrap text-[11px] font-medium text-red-600 hover:underline"
+                    >
+                      Remove photo
+                    </button>
+                  )}
+                  {!isEditing && profileImage && isDataUrl(profileImage) && (
+                    <span className="whitespace-nowrap rounded-md bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-700 ring-1 ring-amber-200">
+                      Profile picture was not saved — upload failed
+                    </span>
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <p className="truncate text-lg font-semibold text-gray-900">{displayName}</p>
+                  <p className="text-sm text-gray-500 capitalize">{user?.role} Account</p>
+                </div>
               </div>
-              <div>
-                <h2 className="text-2xl font-semibold text-gray-900">{user?.name}</h2>
-                <p className="text-gray-500 capitalize">{user?.role} Account</p>
-              </div>
+              {!isEditing && (
+                <Button
+                  variant="outline"
+                  onClick={() => setIsEditing(true)}
+                  className="w-full shrink-0 sm:w-auto"
+                >
+                  <Pencil className="w-4 h-4 mr-2" />
+                  Edit Profile
+                </Button>
+              )}
             </div>
-            {!isEditing ? (
-              <Button
-                variant="outline"
-                onClick={() => setIsEditing(true)}
-              >
-                Edit Profile
-              </Button>
-            ) : (
-              <div className="flex gap-2">
+          </div>
+        </Card>
+
+        {/* Personal Information */}
+        {isEditing ? (
+          <Card className="bg-white shadow-sm">
+            <div className="p-5">
+              <SectionHeading>Personal Information</SectionHeading>
+              <div className="mt-4 space-y-4">
+                <div className="space-y-1.5">
+                  <Label htmlFor="firstName">First Name</Label>
+                  <div className="flex items-center gap-2">
+                    <User className="w-4 h-4 text-gray-400" />
+                    <Input
+                      id="firstName"
+                      type="text"
+                      value={formData.firstName}
+                      onChange={(e) => setFormData(prev => ({ ...prev, firstName: e.target.value }))}
+                      maxLength={50}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="lastName">Last Name</Label>
+                  <div className="flex items-center gap-2">
+                    <User className="w-4 h-4 text-gray-400" />
+                    <Input
+                      id="lastName"
+                      type="text"
+                      value={formData.lastName}
+                      onChange={(e) => setFormData(prev => ({ ...prev, lastName: e.target.value }))}
+                      maxLength={50}
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="email">Email Address</Label>
+                  <div className="flex items-center gap-2">
+                    <Mail className="w-4 h-4 text-gray-400" />
+                    <Input
+                      id="email"
+                      type="email"
+                      value={formData.email}
+                      disabled
+                      aria-disabled="true"
+                      title="Your registered email address cannot be changed"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="phone">Contact Number</Label>
+                  <div className="flex items-center gap-2">
+                    <Phone className="w-4 h-4 text-gray-400" />
+                    <Input
+                      id="phone"
+                      type="tel"
+                      phoneOnly
+                      maxDigits={11}
+                      value={formData.phone}
+                      onChange={(e) => setFormData(prev => ({ ...prev, phone: e.target.value }))}
+                      placeholder="09XXXXXXXXX"
+                      maxLength={11}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Edit mode actions */}
+              <div className="mt-6 flex gap-3 border-t border-gray-100 pt-5">
                 <Button
                   variant="outline"
                   onClick={() => setIsEditing(false)}
+                  className="flex-1 h-12"
                 >
                   Cancel
                 </Button>
                 <Button
-                  className="bg-[#2F6FD6] hover:bg-[#2557b8]"
+                  variant="primary"
                   onClick={handleSave}
+                  className="flex-1 h-12"
                 >
                   Save Changes
                 </Button>
               </div>
-            )}
-          </div>
-
-          {/* Profile Information */}
-          <div className="space-y-6">
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="firstName">First Name</Label>
-                <div className="flex items-center gap-2">
-                  <User className="w-4 h-4 text-gray-400" />
-                  <Input
-                    id="firstName"
-                    type="text"
-                    value={formData.firstName}
-                    onChange={(e) => setFormData(prev => ({ ...prev, firstName: e.target.value }))}
-                    disabled={!isEditing}
-                  />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="lastName">Last Name</Label>
-                <div className="flex items-center gap-2">
-                  <User className="w-4 h-4 text-gray-400" />
-                  <Input
-                    id="lastName"
-                    type="text"
-                    value={formData.lastName}
-                    onChange={(e) => setFormData(prev => ({ ...prev, lastName: e.target.value }))}
-                    disabled={!isEditing}
-                  />
-                </div>
+            </div>
+          </Card>
+        ) : (
+          <Card className="bg-white shadow-sm">
+            <div className="px-5 py-4">
+              <SectionHeading>Personal Information</SectionHeading>
+              <div className="mt-1 divide-y divide-gray-100">
+                <InfoRow icon={<User className="h-4 w-4" />} label="First Name" value={formData.firstName} />
+                <InfoRow icon={<User className="h-4 w-4" />} label="Last Name" value={formData.lastName} />
+                <InfoRow icon={<Mail className="h-4 w-4" />} label="Email Address" value={formData.email} />
+                <InfoRow icon={<Phone className="h-4 w-4" />} label="Contact Number" value={formData.phone} />
               </div>
             </div>
+          </Card>
+        )}
 
-            <div className="space-y-2">
-              <Label htmlFor="email">Email Address</Label>
-              <div className="flex items-center gap-2">
-                <Mail className="w-4 h-4 text-gray-400" />
-                <Input
-                  id="email"
-                  type="email"
-                  value={formData.email}
-                  onChange={(e) => setFormData(prev => ({ ...prev, email: e.target.value }))}
-                  disabled={!isEditing}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="phone">Contact Number</Label>
-              <div className="flex items-center gap-2">
-                <Phone className="w-4 h-4 text-gray-400" />
-                <Input
-                  id="phone"
-                  type="tel"
-                  value={formData.phone}
-                  onChange={(e) => setFormData(prev => ({ ...prev, phone: e.target.value }))}
-                  disabled={!isEditing}
-                />
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="studentId">Student ID</Label>
-              <div className="flex items-center gap-2">
-                <FileText className="w-4 h-4 text-gray-400" />
-                <Input
-                  id="studentId"
-                  type="text"
-                  value={formData.studentId}
-                  disabled
-                  className="bg-gray-50"
-                />
-              </div>
-            </div>
+        {/* Account Security */}
+        <Card className="bg-white shadow-sm">
+          <div className="px-5 py-4">
+            <SectionHeading>Account Security</SectionHeading>
+            <button
+              type="button"
+              onClick={() => setShowChangePasswordDialog(true)}
+              className="-mx-2 mt-2 flex w-full items-center justify-between gap-3 rounded-xl px-2 py-3 text-left transition-colors hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1668D9]"
+            >
+              <span className="flex min-w-0 items-center gap-3">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#F2F7FF] text-[#1668D9]">
+                  <Key className="h-4 w-4" />
+                </span>
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium text-gray-900">Password</span>
+                  <span className="block text-xs text-gray-500">Change your password</span>
+                </span>
+              </span>
+              <ChevronRight className="h-5 w-5 shrink-0 text-gray-400" />
+            </button>
           </div>
         </Card>
 
-        {/* Security Section */}
-        <Card className="p-8 bg-white shadow-sm">
-          <h3 className="text-xl font-semibold text-gray-900 mb-6">Security</h3>
-
-          <div className="space-y-4">
-            <div className="flex items-center justify-between pb-4 border-b">
-              <div>
-                <p className="font-medium text-gray-900">Password</p>
-                <p className="text-sm text-gray-500 mt-1">Change your account password</p>
-              </div>
-              <Button
-                variant="outline"
-                onClick={() => setShowChangePasswordDialog(true)}
-                className="border-[#2F6FD6] text-[#2F6FD6] hover:bg-white border-2 border-blue-200"
-              >
-                <Key className="w-4 h-4 mr-2" />
-                Change Password
-              </Button>
-            </div>
-
-            <div className="flex items-center justify-between pt-2">
-              <div>
-                <div className="flex items-center gap-2">
-                  <p className="font-medium text-gray-900">Multi-Factor Authentication</p>
-                  {user?.mfaEnabled && (
-                    <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs rounded-full font-medium">
-                      Enabled
-                    </span>
-                  )}
-                </div>
-                <p className="text-sm text-gray-500 mt-1">
-                  {user?.mfaEnabled
-                    ? 'Additional security layer is active'
-                    : 'Add an extra layer of security to your account'}
-                </p>
-              </div>
-              <Button
-                variant="outline"
-                onClick={user?.mfaEnabled ? handleDisableMFA : handleEnableMFA}
-                className={
-                  user?.mfaEnabled
-                    ? 'border-blue-300 text-red-400 hover:bg-white border-2 border-blue-200'
-                    : 'border-blue-600 text-blue-600 hover:bg-white border-2 border-blue-200'
-                }
-              >
-                <Shield className="w-4 h-4 mr-2" />
-                {user?.mfaEnabled ? 'Disable MFA' : 'Enable MFA'}
-              </Button>
-            </div>
-          </div>
-        </Card>
+        {/* Sign Out (destructive, separate from profile content) */}
+        <div className="pt-1 pb-4">
+          <Button
+            variant="destructive"
+            onClick={() => setShowLogoutConfirm(true)}
+            className="h-12 w-full"
+          >
+            <LogOut className="w-4 h-4 mr-2" />
+            Sign Out
+          </Button>
+        </div>
       </div>
 
       {/* Save Confirmation Dialog */}
-      <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
+      <Dialog open={showSaveDialog} onOpenChange={(open) => { if (!isSaving) setShowSaveDialog(open); }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <div className="flex items-center gap-3 mb-2">
               <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-                <AlertCircle className="w-6 h-6 text-[#1D73EC]" />
+                <AlertCircle className="w-6 h-6 text-[#1668D9]" />
               </div>
               <DialogTitle className="text-xl">Save Changes?</DialogTitle>
             </div>
@@ -389,70 +522,18 @@ export default function CustomerProfile() {
             <Button
               variant="outline"
               onClick={() => setShowSaveDialog(false)}
+              disabled={isSaving}
             >
               Cancel
             </Button>
             <Button
+              variant="primary"
               onClick={confirmSave}
-              className="bg-[#1D73EC] hover:bg-[#10316B] text-white"
+              disabled={isSaving}
+              loading={isSaving}
+              loadingText="Saving..."
             >
               Save Changes
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* MFA Setup Dialog */}
-      <Dialog open={showMFADialog} onOpenChange={setShowMFADialog}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <div className="flex items-center gap-3 mb-2">
-              <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-                <Shield className="w-6 h-6 text-blue-600" />
-              </div>
-              <DialogTitle className="text-xl">Enable Multi-Factor Authentication</DialogTitle>
-            </div>
-            <DialogDescription className="text-base">
-              Scan this QR code with your authenticator app
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="bg-white p-4 border-2 border-gray-200 rounded-lg">
-              <div className="bg-gray-100 h-48 flex items-center justify-center rounded">
-                <p className="text-sm text-gray-500 text-center px-4">
-                  QR Code Placeholder<br />
-                  <span className="text-xs">In production, show actual TOTP QR code</span>
-                </p>
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label>Or enter this code manually:</Label>
-              <Input
-                value={mfaSecret}
-                readOnly
-                className="font-mono text-xs"
-              />
-            </div>
-            <div className="p-3 bg-white border-2 border-blue-200 rounded-lg">
-              <p className="text-sm text-blue-900">
-                <strong>Setup Instructions:</strong>
-              </p>
-              <ol className="text-xs text-blue-800 mt-2 space-y-1 list-decimal list-inside">
-                <li>Download an authenticator app (Google Authenticator, Authy, etc.)</li>
-                <li>Scan the QR code or enter the code manually</li>
-                <li>Enter the 6-digit code from your app when logging in</li>
-              </ol>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button
-              onClick={() => {
-                setShowMFADialog(false);
-                toast.success('Multi-factor authentication enabled successfully!');
-              }}
-              className="bg-blue-600 hover:bg-blue-700 text-white"
-            >
-              Done
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -464,7 +545,7 @@ export default function CustomerProfile() {
           <DialogHeader>
             <div className="flex items-center gap-3 mb-2">
               <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-                <Key className="w-6 h-6 text-[#1D73EC]" />
+                <Key className="w-6 h-6 text-[#1668D9]" />
               </div>
               <DialogTitle className="text-xl">Change Password</DialogTitle>
             </div>
@@ -475,24 +556,45 @@ export default function CustomerProfile() {
           <div className="space-y-4 py-4">
             <div className="space-y-2">
               <Label htmlFor="currentPassword">Current Password</Label>
-              <Input
-                id="currentPassword"
-                type="password"
-                value={passwordData.currentPassword}
-                onChange={(e) => setPasswordData(prev => ({ ...prev, currentPassword: e.target.value }))}
-                placeholder="Enter current password"
-              />
+              <div className="relative">
+                <Input
+                  id="currentPassword"
+                  type={showCurrentPassword ? "text" : "password"}
+                  value={passwordData.currentPassword}
+                  onChange={(e) => setPasswordData(prev => ({ ...prev, currentPassword: e.target.value }))}
+                  placeholder="Enter current password"
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowCurrentPassword(!showCurrentPassword)}
+                  aria-label={showCurrentPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600"
+                >
+                  {showCurrentPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </div>
             <div className="space-y-2">
               <Label htmlFor="newPassword">New Password</Label>
-              <Input
-                id="newPassword"
-                type="password"
-                value={passwordData.newPassword}
-                onChange={(e) => setPasswordData(prev => ({ ...prev, newPassword: e.target.value }))}
-                placeholder="Enter new password (min. 8 characters)"
-                className={passwordData.currentPassword && passwordData.newPassword && passwordData.currentPassword === passwordData.newPassword ? "border-red-500" : ""}
-              />
+              <div className="relative">
+                <Input
+                  id="newPassword"
+                  type={showNewPassword ? "text" : "password"}
+                  value={passwordData.newPassword}
+                  onChange={(e) => setPasswordData(prev => ({ ...prev, newPassword: e.target.value }))}
+                  placeholder="Enter new password (min. 8 characters)"
+                  className={`pr-10 ${passwordData.currentPassword && passwordData.newPassword && passwordData.currentPassword === passwordData.newPassword ? "border-red-500" : ""}`}
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowNewPassword(!showNewPassword)}
+                  aria-label={showNewPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600"
+                >
+                  {showNewPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
               {passwordData.currentPassword && passwordData.newPassword && passwordData.currentPassword === passwordData.newPassword && (
                 <div className="flex items-center gap-2 text-red-600 text-sm mt-1">
                   <AlertCircle className="w-4 h-4" />
@@ -507,13 +609,24 @@ export default function CustomerProfile() {
             </div>
             <div className="space-y-2">
               <Label htmlFor="confirmPassword">Confirm New Password</Label>
-              <Input
-                id="confirmPassword"
-                type="password"
-                value={passwordData.confirmPassword}
-                onChange={(e) => setPasswordData(prev => ({ ...prev, confirmPassword: e.target.value }))}
-                placeholder="Re-enter new password"
-              />
+              <div className="relative">
+                <Input
+                  id="confirmPassword"
+                  type={showConfirmPassword ? "text" : "password"}
+                  value={passwordData.confirmPassword}
+                  onChange={(e) => setPasswordData(prev => ({ ...prev, confirmPassword: e.target.value }))}
+                  placeholder="Re-enter new password"
+                  className="pr-10"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                  aria-label={showConfirmPassword ? "Hide password" : "Show password"}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-600"
+                >
+                  {showConfirmPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
             </div>
           </div>
           <DialogFooter className="gap-2 sm:gap-0">
@@ -531,19 +644,62 @@ export default function CustomerProfile() {
               Cancel
             </Button>
             <Button
+              variant="primary"
               onClick={handleChangePassword}
               disabled={!validatePassword(passwordData.newPassword).isValid || (passwordData.currentPassword === passwordData.newPassword && passwordData.currentPassword !== '')}
-              className={`${
-                validatePassword(passwordData.newPassword).isValid && !(passwordData.currentPassword === passwordData.newPassword && passwordData.currentPassword !== '')
-                  ? "bg-[#1D73EC] hover:bg-[#10316B] text-white"
-                  : "bg-gray-300 text-gray-500 cursor-not-allowed"
-              }`}
             >
               Change Password
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {showSuccessDialog && (
+        <Dialog open onOpenChange={setShowSuccessDialog}>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="text-[#10316B] flex items-center gap-2">
+                <CheckCircle className="w-5 h-5 text-emerald-500" /> Profile updated
+              </DialogTitle>
+              <DialogDescription>
+                Your profile has been updated successfully.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShowSuccessDialog(false)}>
+                OK
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {showLogoutConfirm && (
+        <ConfirmationDialog
+          open
+          onOpenChange={setShowLogoutConfirm}
+          onConfirm={() => { logout(); setShowLogoutConfirm(false); }}
+          title="Sign out of Docufy?"
+          description="You will be returned to the sign-in page. Your session will be preserved, but sign-in will be required to continue."
+          confirmLabel="Sign Out"
+          cancelLabel="Stay Signed In"
+          destructive={false}
+        />
+      )}
+
+      <AvatarCropDialog
+        open={cropSource !== null}
+        imageSrc={cropSource}
+        onOpenChange={(open) => {
+          if (!open) setCropSource(null);
+        }}
+        onApply={(cropped) => {
+          setProfileImage(cropped);
+          setCropSource(null);
+          toast.success('Photo ready — save to apply it.');
+        }}
+      />
+
     </Layout>
   );
 }
